@@ -14,7 +14,7 @@ RUN CGO_ENABLED=0 go build \
     -ldflags="-w -s -X github.com/maborak/mabo-tunnel/internal/version.Version=${VERSION}" \
     -o mabo-tunnel-server ./cmd/server
 
-FROM alpine:3.20
+FROM alpine:3.24
 
 RUN adduser -D -u 1000 mabo-tunnel
 WORKDIR /app
