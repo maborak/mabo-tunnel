@@ -1,0 +1,36 @@
+services:
+  mabo-tunnel:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ./data/users.txt:/app/data/users.txt:ro
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  caddy:
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
+    restart: unless-stopped
+    ports:
+      - "${BIND_IP:-0.0.0.0}:80:80"
+      - "${BIND_IP:-0.0.0.0}:443:443"
+      - "${BIND_IP:-0.0.0.0}:443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      - CF_API_TOKEN=${CF_API_TOKEN}
+    depends_on:
+      mabo-tunnel:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

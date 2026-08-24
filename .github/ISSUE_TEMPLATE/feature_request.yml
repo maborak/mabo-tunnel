@@ -1,0 +1,67 @@
+name: Feature request
+description: Propose a capability Mabo Tunnel does not have
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Mabo Tunnel is deliberately small: one Go module, no database, flat-file
+        auth, single binary. Proposals that keep that shape land much faster
+        than ones that widen it.
+
+        Check the open issues first — several known gaps are already tracked there.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you trying to do that you cannot do today? Describe the
+        situation, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: >
+        What should happen instead. If it adds a flag, a config key, or a
+        protocol message, say exactly which.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Server (routing, quotas, TLS)
+        - Client (forwarding, reconnect, config)
+        - Wire protocol
+        - Auth / tokens / plans
+        - Dashboard or TUI
+        - Build / packaging / deployment
+        - Docs
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: >
+        Including doing it outside Mabo Tunnel — a reverse proxy rule, a wrapper
+        script, an existing flag used differently.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: This does not require a database or an external service
+          required: false
+        - label: This does not break wire compatibility with existing clients
+          required: false
+        - label: I am willing to work on this
+          required: false

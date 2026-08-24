@@ -1,0 +1,36 @@
+# Mabo Tunnel client configuration.
+# Copy this file to mabo-tunnel.yml and edit the values.
+# CLI flags take precedence over anything set here.
+
+# Server WebSocket URL.
+# Default when unset: ws://localhost:8080 (or $MABO_TUNNEL_SERVER).
+# Use wss:// for a TLS-terminated server.
+server: wss://tunnel.example.com
+
+# Authentication token (required). Generate one on the server with:
+#   mabo-tunnel-token generate <username> <plan>
+token: REPLACE_WITH_A_GENERATED_TOKEN
+
+# Named tunnels — each gets its own stable subdomain, e.g.
+# <username>_web.tunnel.example.com
+tunnels:
+  web:
+    port: 5173
+
+  api:
+    port: 9001
+
+    # Forward to a host other than localhost (optional).
+    # host: 192.168.0.40
+
+    # HTTP Basic Auth on this tunnel's public endpoint (optional).
+    # auth: "user:pass"
+
+    # Manipulate headers on proxied requests (optional).
+    headers:
+      # Added or overridden on the way to your local service.
+      add:
+        X-Forwarded-By: mabo-tunnel
+      # Stripped from the incoming request before forwarding.
+      remove:
+        - Cookie

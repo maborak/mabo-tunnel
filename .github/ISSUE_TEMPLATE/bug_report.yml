@@ -1,0 +1,101 @@
+name: Bug report
+description: Something behaves differently than documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report.
+
+        **If this is a security issue, stop here** and follow
+        [SECURITY.md](https://github.com/maborak/mabo-tunnel/blob/main/SECURITY.md)
+        instead — do not describe it in a public issue.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: >
+        The exact commands, including the server and client invocations. Redact
+        tokens and hostnames — the shape matters, the values do not.
+      placeholder: |
+        1. mabo-tunnel-server --domain=localhost --addr=:8080
+        2. mabo-tunnel-client --server=ws://localhost:8080 --token=REDACTED --port=3000
+        3. curl http://<subdomain>.localhost:8080/some/path
+        4. ...
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: side
+    attributes:
+      label: Which side
+      options:
+        - Server
+        - Client
+        - Both / the tunnel between them
+        - Dashboard or TUI
+        - Build / AIO / deployment
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "Output of `mabo-tunnel-server --version` or the commit SHA you built."
+      placeholder: v0.1.0 / 3210160
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: linux/amd64, macOS 15 arm64, Windows 11 amd64
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How is the server deployed
+      options:
+        - Local (make run-server-local)
+        - Behind Caddy or another reverse proxy
+        - AIO mode (built-in TLS)
+        - Docker / docker-compose
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Server and/or client output. Re-run with `--log-level=debug` if you can
+        — and **check the output for tokens before pasting it**.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I read the relevant doc in `docs/` and this contradicts it
+          required: false
+        - label: I checked that this is not listed as intentional in `docs/security.md` or `SECURITY.md`
+          required: false
+        - label: I removed every token, real hostname, and credential from the text above
+          required: true

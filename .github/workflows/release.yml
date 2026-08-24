@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64, ext: .exe }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          # Full history so `git describe` can stamp a meaningful version.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && VERSION="${{ github.event.inputs.tag }}"
+          LDFLAGS="-s -w -X github.com/maborak/mabo-tunnel/internal/version.Version=${VERSION}"
+          SUFFIX="${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          mkdir -p dist
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/mabo-tunnel-server-${SUFFIX}" ./cmd/server
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/mabo-tunnel-client-${SUFFIX}" ./cmd/client
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/mabo-tunnel-token-${SUFFIX}"  ./cmd/token
+
+      # A checksum file per job; they are merged in the release step below.
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > "SHA256SUMS-${{ matrix.goos }}-${{ matrix.goarch }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          retention-days: 1
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Merge checksums
+        working-directory: artifacts
+        run: |
+          cat SHA256SUMS-*.txt | sort -k2 > SHA256SUMS.txt
+          rm -f SHA256SUMS-*.txt
+          echo "--- release contents ---"
+          ls -lh
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}
+          body: |
+            ## Install
+
+            Download the binary for your platform below, or:
+
+            ```bash
+            go install github.com/maborak/mabo-tunnel/cmd/client@${{ github.event.inputs.tag || github.ref_name }}
+            ```
+
+            Verify a download against `SHA256SUMS.txt`:
+
+            ```bash
+            sha256sum -c --ignore-missing SHA256SUMS.txt
+            ```
+
+            > **Note:** these binaries default to a **local** server
+            > (`ws://localhost:8080`). Point the client at your own deployment
+            > with `--server` or `MABO_TUNNEL_SERVER`. See
+            > [docs/deployment.md](https://github.com/maborak/mabo-tunnel/blob/main/docs/deployment.md).
+
+            ---

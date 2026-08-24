@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mabo Tunnel - Tunnel Inspector</title>
+<style>
+  :root {
+    --bg-primary: #0d1117;
+    --bg-secondary: #161b22;
+    --bg-tertiary: #21262d;
+    --bg-hover: #30363d;
+    --border: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-muted: #6e7681;
+    --accent: #58a6ff;
+    --accent-hover: #79c0ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --orange: #d29922;
+    --purple: #bc8cff;
+    --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    --radius: 6px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font-sans);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    grid-template-rows: 48px 1fr;
+    height: 100vh;
+  }
+
+  /* Header */
+  .header {
+    grid-column: 1 / -1;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    gap: 12px;
+  }
+  .header .logo { font-weight: 700; font-size: 15px; color: var(--accent); }
+  .header .sep { color: var(--text-muted); font-size: 18px; font-weight: 300; }
+  .header .title { font-size: 13px; color: var(--text-secondary); font-weight: 500; }
+  .header .status {
+    margin-left: auto;
+    display: flex; align-items: center; gap: 16px;
+    font-size: 12px; color: var(--text-secondary);
+  }
+  .header .dot {
+    display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; background: var(--green); margin-right: 4px;
+  }
+
+  /* Sidebar */
+  .sidebar {
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border);
+    overflow-y: auto; padding: 12px 0;
+  }
+  .sidebar-title {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--text-muted); padding: 8px 16px 6px;
+  }
+  .tunnel-item {
+    padding: 10px 16px; cursor: pointer;
+    border-left: 2px solid transparent; transition: all 0.15s;
+  }
+  .tunnel-item:hover { background: var(--bg-tertiary); }
+  .tunnel-item.active { background: var(--bg-tertiary); border-left-color: var(--accent); }
+  .tunnel-item .subdomain { font-family: var(--font-mono); font-size: 13px; font-weight: 600; }
+  .tunnel-item .meta {
+    font-size: 11px; color: var(--text-muted); margin-top: 3px;
+    display: flex; gap: 8px;
+  }
+  .no-tunnels { padding: 24px 16px; text-align: center; color: var(--text-muted); font-size: 13px; }
+
+  /* Main — split into request list (top) and detail (bottom) with drag handle */
+  .main {
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .main-empty {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: var(--text-muted); font-size: 14px;
+  }
+
+  /* Request list */
+  .request-list { flex: 1; overflow-y: auto; min-height: 100px; }
+  .request-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .request-table th {
+    position: sticky; top: 0; background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border); padding: 8px 12px; text-align: left;
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--text-muted); z-index: 1;
+  }
+  .request-table td {
+    padding: 8px 12px; border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+  .request-table tr { cursor: pointer; transition: background 0.1s; }
+  .request-table tbody tr:hover { background: var(--bg-tertiary); }
+  .request-table tbody tr.selected { background: rgba(88,166,255,0.08); }
+
+  .method {
+    font-family: var(--font-mono); font-weight: 700; font-size: 11px;
+    padding: 2px 6px; border-radius: 3px; display: inline-block;
+  }
+  .method-GET { background: rgba(63,185,80,0.15); color: var(--green); }
+  .method-POST { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .method-PUT { background: rgba(210,153,34,0.15); color: var(--orange); }
+  .method-PATCH { background: rgba(210,153,34,0.15); color: var(--orange); }
+  .method-DELETE { background: rgba(248,81,73,0.15); color: var(--red); }
+  .method-HEAD { background: rgba(139,148,158,0.15); color: var(--text-secondary); }
+  .method-OPTIONS { background: rgba(188,140,255,0.15); color: var(--purple); }
+
+  .status-code { font-family: var(--font-mono); font-weight: 600; font-size: 12px; }
+  .status-2xx { color: var(--green); }
+  .status-3xx { color: var(--accent); }
+  .status-4xx { color: var(--orange); }
+  .status-5xx { color: var(--red); }
+
+  .path-cell {
+    font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary);
+    max-width: 400px; overflow: hidden; text-overflow: ellipsis;
+  }
+  .duration-cell { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
+  .time-cell { font-size: 11px; color: var(--text-muted); }
+
+  /* Drag handle between request list and detail panel */
+  .drag-handle {
+    height: 5px; background: var(--border); cursor: row-resize;
+    display: none; flex-shrink: 0;
+    transition: background 0.15s;
+  }
+  .drag-handle:hover, .drag-handle.dragging { background: var(--accent); }
+  .drag-handle.visible { display: block; }
+
+  /* Detail panel */
+  .detail-panel {
+    background: var(--bg-secondary);
+    overflow-y: auto; display: none; flex-shrink: 0;
+  }
+  .detail-panel.visible { display: flex; flex-direction: column; }
+
+  .detail-header {
+    display: flex; align-items: center; padding: 10px 16px; gap: 10px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary); flex-shrink: 0;
+  }
+  .close-btn {
+    background: none; border: none; color: var(--text-muted);
+    cursor: pointer; font-size: 18px; line-height: 1; padding: 2px;
+  }
+  .close-btn:hover { color: var(--text-primary); }
+
+  .replay-btn {
+    background: var(--bg-tertiary); border: 1px solid var(--border);
+    color: var(--accent); padding: 4px 12px; border-radius: var(--radius);
+    cursor: pointer; font-size: 12px; font-weight: 600; transition: all 0.15s;
+    margin-left: auto;
+  }
+  .replay-btn:hover { background: var(--bg-hover); border-color: var(--accent); }
+  .replay-btn.success { color: var(--green); border-color: var(--green); }
+  .replay-btn.error { color: var(--red); border-color: var(--red); }
+
+  .detail-content { overflow-y: auto; flex: 1; padding: 12px 16px; }
+
+  /* Tabs in detail */
+  .detail-tabs {
+    display: flex; gap: 0; border-bottom: 1px solid var(--border);
+    padding: 0 16px; flex-shrink: 0;
+  }
+  .detail-tab {
+    padding: 8px 14px; cursor: pointer; font-size: 12px; font-weight: 600;
+    color: var(--text-muted); border-bottom: 2px solid transparent;
+    transition: all 0.15s;
+  }
+  .detail-tab:hover { color: var(--text-secondary); }
+  .detail-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+
+  .detail-section { margin-bottom: 16px; }
+  .detail-section h4 {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--text-muted); margin-bottom: 6px;
+  }
+  .detail-section pre {
+    background: var(--bg-primary); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 10px 12px;
+    font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary);
+    overflow-x: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.5;
+  }
+  .header-key { color: var(--accent); }
+  .header-val { color: var(--text-secondary); }
+
+  .kv-row { display: flex; padding: 4px 0; border-bottom: 1px solid rgba(48,54,61,0.5); }
+  .kv-key {
+    flex: 0 0 180px; font-family: var(--font-mono); font-size: 12px;
+    color: var(--accent); font-weight: 500;
+  }
+  .kv-val {
+    flex: 1; font-family: var(--font-mono); font-size: 12px;
+    color: var(--text-secondary); word-break: break-all;
+  }
+
+  .copy-section { margin-bottom: 16px; }
+  .copy-section h4 {
+    font-size: 12px; font-weight: 600; color: var(--text-primary);
+    margin-bottom: 8px; display: flex; align-items: center; gap: 8px;
+  }
+  .copy-btn {
+    background: var(--bg-tertiary); border: 1px solid var(--border);
+    color: var(--accent); padding: 3px 10px; border-radius: var(--radius);
+    cursor: pointer; font-size: 11px; font-weight: 600;
+    transition: all 0.15s;
+  }
+  .copy-btn:hover { background: var(--bg-hover); border-color: var(--accent); }
+  .copy-btn.copied { color: var(--green); border-color: var(--green); }
+  .code-block {
+    background: var(--bg-primary); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px;
+    font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary);
+    overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+    line-height: 1.6; max-height: 200px; overflow-y: auto;
+  }
+
+  /* Filter toolbar */
+  .filter-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .filter-group {
+    display: flex; gap: 4px; align-items: center;
+  }
+  .filter-label {
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.5px; color: var(--text-muted); margin-right: 2px;
+  }
+  .filter-pill {
+    font-size: 11px; font-weight: 600; padding: 3px 8px;
+    border-radius: 3px; cursor: pointer; border: 1px solid var(--border);
+    background: transparent; color: var(--text-muted); transition: all 0.15s;
+    font-family: var(--font-mono); position: relative;
+  }
+  .filter-badge {
+    position: absolute; top: -7px; right: -7px;
+    min-width: 16px; height: 16px; padding: 0 4px;
+    border-radius: 8px; font-size: 9px; font-weight: 700;
+    line-height: 16px; text-align: center;
+    background: var(--bg-hover); color: var(--text-secondary);
+    font-family: var(--font-mono); pointer-events: none;
+  }
+  .filter-pill.active .filter-badge { background: var(--accent); color: var(--bg-primary); }
+  .filter-pill.active-green .filter-badge { background: var(--green); color: var(--bg-primary); }
+  .filter-pill.active-orange .filter-badge { background: var(--orange); color: var(--bg-primary); }
+  .filter-pill.active-red .filter-badge { background: var(--red); color: var(--bg-primary); }
+  .filter-pill:hover { border-color: var(--text-secondary); color: var(--text-secondary); }
+  .filter-pill.active { border-color: var(--accent); color: var(--accent); background: rgba(88,166,255,0.1); }
+  .filter-pill.active-green { border-color: var(--green); color: var(--green); background: rgba(63,185,80,0.1); }
+  .filter-pill.active-orange { border-color: var(--orange); color: var(--orange); background: rgba(210,153,34,0.1); }
+  .filter-pill.active-red { border-color: var(--red); color: var(--red); background: rgba(248,81,73,0.1); }
+  .filter-sep {
+    width: 1px; height: 20px; background: var(--border); margin: 0 4px;
+  }
+  .filter-search {
+    flex: 1; min-width: 120px; max-width: 280px; margin-left: auto;
+    background: var(--bg-primary); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 4px 10px;
+    font-size: 12px; color: var(--text-primary); outline: none;
+    font-family: var(--font-mono);
+  }
+  .filter-search::placeholder { color: var(--text-muted); }
+  .filter-search:focus { border-color: var(--accent); }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+</style>
+</head>
+<body>
+<div class="layout">
+  <div class="header">
+    <span class="logo">Mabo Tunnel</span>
+    <span class="sep">/</span>
+    <span class="title">Tunnel Inspector</span>
+    <div class="status">
+      <span id="statusUptime"></span>
+      <span><span class="dot"></span><span id="statusTunnels">0</span> tunnels</span>
+    </div>
+  </div>
+
+  <div class="sidebar">
+    <div class="sidebar-title">Active Tunnels</div>
+    <div id="tunnelList"><div class="no-tunnels">No active tunnels</div></div>
+  </div>
+
+  <div class="main">
+    <div class="main-empty" id="emptyState">Select a tunnel to inspect requests</div>
+    <div class="request-list" id="requestList" style="display:none;">
+      <div class="filter-bar" id="filterBar">
+        <div class="filter-group">
+          <span class="filter-label">Method</span>
+          <button class="filter-pill" data-method="GET">GET</button>
+          <button class="filter-pill" data-method="POST">POST</button>
+          <button class="filter-pill" data-method="PUT">PUT</button>
+          <button class="filter-pill" data-method="PATCH">PATCH</button>
+          <button class="filter-pill" data-method="DELETE">DEL</button>
+          <button class="filter-pill" data-method="OPTIONS">OPT</button>
+        </div>
+        <div class="filter-sep"></div>
+        <div class="filter-group">
+          <span class="filter-label">Status</span>
+          <button class="filter-pill" data-status="2xx">2xx</button>
+          <button class="filter-pill" data-status="3xx">3xx</button>
+          <button class="filter-pill" data-status="4xx">4xx</button>
+          <button class="filter-pill" data-status="5xx">5xx</button>
+        </div>
+        <input type="text" class="filter-search" id="filterSearch" placeholder="Search path...">
+      </div>
+      <table class="request-table">
+        <thead><tr>
+          <th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>Time</th>
+        </tr></thead>
+        <tbody id="requestBody"></tbody>
+      </table>
+    </div>
+    <div class="drag-handle" id="dragHandle"></div>
+    <div class="detail-panel" id="detailPanel">
+      <div class="detail-header">
+        <button class="close-btn" id="closeDetail" title="Close">&times;</button>
+        <span id="detailTitle" style="font-weight:600;font-size:13px;"></span>
+        <button class="replay-btn" id="replayBtn">&#9654; Replay</button>
+      </div>
+      <div class="detail-tabs" id="detailTabs">
+        <div class="detail-tab active" data-tab="headers">Request Headers</div>
+        <div class="detail-tab" data-tab="response">Response Headers</div>
+        <div class="detail-tab" data-tab="body">Body</div>
+        <div class="detail-tab" data-tab="meta">Meta</div>
+        <div class="detail-tab" data-tab="curl">Copy as...</div>
+      </div>
+      <div class="detail-content" id="detailContent">
+        <div class="tab-pane active" id="tab-headers"></div>
+        <div class="tab-pane" id="tab-response"></div>
+        <div class="tab-pane" id="tab-body"></div>
+        <div class="tab-pane" id="tab-meta"></div>
+        <div class="tab-pane" id="tab-curl"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  const API = '/_api';
+  let activeTunnelID = null;
+  let selectedReqID = null;
+  let currentReq = null;
+  let detailHeight = 350;
+
+  // Filter state
+  const activeMethodFilters = new Set();
+  const activeStatusFilters = new Set();
+  let searchQuery = '';
+
+  // --- Fetch helpers ---
+  async function api(path) {
+    const r = await fetch(API + path);
+    if (!r.ok) throw new Error(r.statusText);
+    return r.json();
+  }
+
+  // --- Time / format helpers ---
+  function timeAgo(ts) {
+    const d = Date.now() - new Date(ts).getTime();
+    if (d < 1000) return 'now';
+    if (d < 60000) return Math.floor(d/1000) + 's';
+    if (d < 3600000) return Math.floor(d/60000) + 'm';
+    return Math.floor(d/3600000) + 'h';
+  }
+  function fmtDur(ms) {
+    if (ms < 1) return '<1ms';
+    if (ms < 1000) return Math.round(ms) + 'ms';
+    return (ms/1000).toFixed(2) + 's';
+  }
+  function statusCls(c) {
+    if (c >= 200 && c < 300) return 'status-2xx';
+    if (c >= 300 && c < 400) return 'status-3xx';
+    if (c >= 400 && c < 500) return 'status-4xx';
+    return 'status-5xx';
+  }
+  function esc(s) {
+    if (!s) return '';
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  // --- Tunnels ---
+  async function loadTunnels() {
+    try {
+      const [tunnels, status] = await Promise.all([api('/tunnels'), api('/status')]);
+      document.getElementById('statusTunnels').textContent = status.active_tunnels;
+      document.getElementById('statusUptime').textContent = 'up ' + status.uptime;
+
+      const list = document.getElementById('tunnelList');
+      if (!tunnels || !tunnels.length) {
+        list.innerHTML = '<div class="no-tunnels">No active tunnels</div>';
+        return;
+      }
+
+      list.innerHTML = tunnels.map(t => {
+        const act = t.id === activeTunnelID ? ' active' : '';
+        return `<div class="tunnel-item${act}" data-id="${t.id}">
+          <div class="subdomain">${esc(t.subdomain)}</div>
+          <div class="meta"><span>${t.request_count} reqs</span><span>${timeAgo(t.connected_at)}</span></div>
+        </div>`;
+      }).join('');
+
+      list.querySelectorAll('.tunnel-item').forEach(el =>
+        el.addEventListener('click', () => selectTunnel(el.dataset.id)));
+
+      // Auto-select first if none selected
+      if (!activeTunnelID && tunnels.length) selectTunnel(tunnels[0].id);
+    } catch (e) { console.error('loadTunnels:', e); }
+  }
+
+  function selectTunnel(id) {
+    activeTunnelID = id;
+    selectedReqID = null;
+    document.querySelectorAll('.tunnel-item').forEach(el =>
+      el.classList.toggle('active', el.dataset.id === id));
+    document.getElementById('emptyState').style.display = 'none';
+    document.getElementById('requestList').style.display = '';
+    hideDetail();
+    loadRequests();
+  }
+
+  // --- Requests ---
+  async function loadRequests() {
+    if (!activeTunnelID) return;
+    try {
+      const reqs = await api('/tunnels/' + activeTunnelID + '/requests');
+      const tbody = document.getElementById('requestBody');
+      if (!reqs || !reqs.length) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:24px;">No requests yet</td></tr>';
+        return;
+      }
+      // Update filter counters
+      const methodCounts = {}, statusCounts = {'2xx':0,'3xx':0,'4xx':0,'5xx':0};
+      for (const r of reqs) {
+        methodCounts[r.method] = (methodCounts[r.method] || 0) + 1;
+        const bucket = Math.floor(r.response_status / 100) + 'xx';
+        if (statusCounts[bucket] !== undefined) statusCounts[bucket]++;
+      }
+      document.querySelectorAll('#filterBar .filter-pill[data-method]').forEach(p => {
+        const c = methodCounts[p.dataset.method] || 0;
+        let badge = p.querySelector('.filter-badge');
+        if (c > 0) {
+          if (!badge) { badge = document.createElement('span'); badge.className = 'filter-badge'; p.appendChild(badge); }
+          badge.textContent = c;
+        } else if (badge) { badge.remove(); }
+      });
+      document.querySelectorAll('#filterBar .filter-pill[data-status]').forEach(p => {
+        const c = statusCounts[p.dataset.status] || 0;
+        let badge = p.querySelector('.filter-badge');
+        if (c > 0) {
+          if (!badge) { badge = document.createElement('span'); badge.className = 'filter-badge'; p.appendChild(badge); }
+          badge.textContent = c;
+        } else if (badge) { badge.remove(); }
+      });
+
+      const filtered = reqs.filter(matchesFilters);
+      if (!filtered.length) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:24px;">No matching requests</td></tr>';
+        return;
+      }
+      const rev = filtered.slice().reverse();
+      tbody.innerHTML = rev.map(r => {
+        const sel = r.id === selectedReqID ? ' selected' : '';
+        return `<tr class="${sel}" data-id="${r.id}">
+          <td><span class="method method-${r.method}">${r.method}</span></td>
+          <td class="path-cell">${esc(r.path)}</td>
+          <td><span class="status-code ${statusCls(r.response_status)}">${r.response_status}</span></td>
+          <td class="duration-cell">${fmtDur(r.duration_ms)}</td>
+          <td class="time-cell">${timeAgo(r.timestamp)}</td>
+        </tr>`;
+      }).join('');
+      tbody.querySelectorAll('tr[data-id]').forEach(el =>
+        el.addEventListener('click', () => selectRequest(el.dataset.id)));
+    } catch (e) { console.error('loadRequests:', e); }
+  }
+
+  // --- Request detail ---
+  async function selectRequest(reqID) {
+    selectedReqID = reqID;
+    document.querySelectorAll('#requestBody tr').forEach(el =>
+      el.classList.toggle('selected', el.dataset.id === reqID));
+    try {
+      currentReq = await api('/tunnels/' + activeTunnelID + '/requests/' + reqID);
+      showDetail(currentReq);
+    } catch (e) { console.error('selectRequest:', e); }
+  }
+
+  function showDetail(req) {
+    const panel = document.getElementById('detailPanel');
+    const handle = document.getElementById('dragHandle');
+    panel.classList.add('visible');
+    handle.classList.add('visible');
+    panel.style.height = detailHeight + 'px';
+
+    document.getElementById('detailTitle').innerHTML =
+      `<span class="method method-${req.method}">${req.method}</span>&nbsp; ${esc(req.path)}`;
+
+    // Tab: Request Headers
+    document.getElementById('tab-headers').innerHTML = renderHeaders(req.request_headers, 'No request headers captured');
+
+    // Tab: Response Headers
+    document.getElementById('tab-response').innerHTML = renderHeaders(req.response_headers, 'No response headers captured');
+
+    // Tab: Body — request body + response body
+    let bodyHtml = '';
+
+    // Request body
+    bodyHtml += '<div style="font-weight:600;font-size:12px;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">Request Body</div>';
+    if (req.request_body && req.request_body.length) {
+      let bodyStr = req.request_body;
+      try { bodyStr = JSON.stringify(JSON.parse(bodyStr), null, 2); } catch {}
+      bodyHtml += `<pre style="background:var(--bg-primary);border:1px solid var(--border);border-radius:var(--radius);padding:12px;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all;line-height:1.5;margin-bottom:16px;">${esc(bodyStr)}</pre>`;
+    } else {
+      bodyHtml += '<div style="color:var(--text-muted);font-size:13px;padding:8px 0;margin-bottom:16px;">No request body</div>';
+    }
+
+    // Response body
+    bodyHtml += '<div style="font-weight:600;font-size:12px;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">Response Body</div>';
+    if (req.response_body && req.response_body.length) {
+      let respStr = req.response_body;
+      try { respStr = JSON.stringify(JSON.parse(respStr), null, 2); } catch {}
+      bodyHtml += `<pre style="background:var(--bg-primary);border:1px solid var(--border);border-radius:var(--radius);padding:12px;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all;line-height:1.5;">${esc(respStr)}</pre>`;
+    } else {
+      bodyHtml += '<div style="color:var(--text-muted);font-size:13px;padding:8px 0;">No response body</div>';
+    }
+
+    document.getElementById('tab-body').innerHTML = bodyHtml;
+
+    // Tab: Meta
+    document.getElementById('tab-meta').innerHTML = `
+      <div class="kv-row"><div class="kv-key">Status</div><div class="kv-val"><span class="status-code ${statusCls(req.response_status)}">${req.response_status}</span></div></div>
+      <div class="kv-row"><div class="kv-key">Duration</div><div class="kv-val">${fmtDur(req.duration_ms)}</div></div>
+      <div class="kv-row"><div class="kv-key">URL</div><div class="kv-val" style="font-family:var(--font-mono)">${esc(req.full_url || '')}</div></div>
+      <div class="kv-row"><div class="kv-key">Host</div><div class="kv-val">${esc(req.host || '')}</div></div>
+      <div class="kv-row"><div class="kv-key">Timestamp</div><div class="kv-val">${new Date(req.timestamp).toLocaleString()}</div></div>
+      <div class="kv-row"><div class="kv-key">Request ID</div><div class="kv-val" style="font-family:var(--font-mono)">${esc(req.id)}</div></div>
+      <div class="kv-row"><div class="kv-key">Tunnel ID</div><div class="kv-val" style="font-family:var(--font-mono)">${esc(req.tunnel_id)}</div></div>
+    `;
+
+    // Tab: Copy as...
+    const curl = buildCurl(req);
+    const fetchCode = buildFetch(req);
+    const wget = buildWget(req);
+    document.getElementById('tab-curl').innerHTML = `
+      <div class="copy-section">
+        <h4>cURL <button class="copy-btn" onclick="copyText(this, 'curl-code')">Copy</button></h4>
+        <div class="code-block" id="curl-code">${esc(curl)}</div>
+      </div>
+      <div class="copy-section">
+        <h4>JavaScript (fetch) <button class="copy-btn" onclick="copyText(this, 'fetch-code')">Copy</button></h4>
+        <div class="code-block" id="fetch-code">${esc(fetchCode)}</div>
+      </div>
+      <div class="copy-section">
+        <h4>wget <button class="copy-btn" onclick="copyText(this, 'wget-code')">Copy</button></h4>
+        <div class="code-block" id="wget-code">${esc(wget)}</div>
+      </div>
+    `;
+
+    switchTab('headers');
+  }
+
+  function hideDetail() {
+    document.getElementById('detailPanel').classList.remove('visible');
+    document.getElementById('dragHandle').classList.remove('visible');
+    selectedReqID = null;
+    currentReq = null;
+    document.querySelectorAll('#requestBody tr').forEach(el => el.classList.remove('selected'));
+  }
+
+  // --- Tabs ---
+  document.getElementById('detailTabs').addEventListener('click', e => {
+    const tab = e.target.closest('.detail-tab');
+    if (tab) switchTab(tab.dataset.tab);
+  });
+  function switchTab(name) {
+    document.querySelectorAll('.detail-tab').forEach(t =>
+      t.classList.toggle('active', t.dataset.tab === name));
+    document.querySelectorAll('.tab-pane').forEach(p =>
+      p.classList.toggle('active', p.id === 'tab-' + name));
+  }
+
+  // --- Replay ---
+  document.getElementById('replayBtn').addEventListener('click', async () => {
+    if (!currentReq) return;
+    const btn = document.getElementById('replayBtn');
+    btn.textContent = 'Sending...';
+    try {
+      // Build the replay URL from the tunnel URL + request path.
+      const tunnelURL = await getTunnelURL(currentReq.tunnel_id);
+      if (!tunnelURL) { btn.textContent = 'No tunnel URL'; return; }
+      const url = tunnelURL + currentReq.path;
+
+      const resp = await fetch(url, {
+        method: currentReq.method,
+        headers: currentReq.method !== 'GET' && currentReq.method !== 'HEAD'
+          ? { 'Content-Type': 'application/json' } : {},
+        mode: 'no-cors',
+      });
+
+      btn.textContent = '✓ Replayed';
+      btn.classList.add('success');
+      setTimeout(() => { btn.textContent = '▶ Replay'; btn.classList.remove('success'); }, 2000);
+
+      // Refresh requests to show the replayed one
+      setTimeout(loadRequests, 500);
+    } catch (e) {
+      btn.textContent = '✗ Failed';
+      btn.classList.add('error');
+      setTimeout(() => { btn.textContent = '▶ Replay'; btn.classList.remove('error'); }, 2000);
+    }
+  });
+
+  async function getTunnelURL(tunnelID) {
+    try {
+      const tunnels = await api('/tunnels');
+      const t = tunnels.find(t => t.id === tunnelID);
+      return t ? t.subdomain : null; // subdomain field holds the full URL
+    } catch { return null; }
+  }
+
+  // --- Close detail ---
+  document.getElementById('closeDetail').addEventListener('click', hideDetail);
+
+  // --- Resizable detail panel ---
+  const handle = document.getElementById('dragHandle');
+  let dragging = false;
+  handle.addEventListener('mousedown', e => {
+    dragging = true;
+    handle.classList.add('dragging');
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const mainEl = document.querySelector('.main');
+    const mainRect = mainEl.getBoundingClientRect();
+    const newHeight = mainRect.bottom - e.clientY;
+    if (newHeight >= 100 && newHeight <= mainRect.height - 100) {
+      detailHeight = newHeight;
+      document.getElementById('detailPanel').style.height = newHeight + 'px';
+    }
+  });
+  document.addEventListener('mouseup', () => {
+    if (dragging) {
+      dragging = false;
+      handle.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    }
+  });
+
+  // --- Render headers helper ---
+  function renderHeaders(headers, emptyMsg) {
+    if (!headers || !Object.keys(headers).length) {
+      return `<div style="color:var(--text-muted);font-size:13px;padding:8px 0;">${emptyMsg}</div>`;
+    }
+    let html = '';
+    for (const [k, vals] of Object.entries(headers)) {
+      for (const v of vals) {
+        html += `<div class="kv-row"><div class="kv-key">${esc(k)}</div><div class="kv-val">${esc(v)}</div></div>`;
+      }
+    }
+    return html;
+  }
+
+  // --- Build cURL command ---
+
+  // Quote a string for safe interpolation into a POSIX shell command.
+  // Everything inside the quotes is literal; a single quote is spelled
+  // '\'' (close quote, escaped quote, reopen). Captured requests are
+  // attacker-controlled — a hostile header or URL must not turn into shell
+  // syntax when a developer pastes a generated command into a terminal.
+  function shellQuote(s) {
+    return "'" + String(s).replace(/'/g, "'\\''") + "'";
+  }
+
+  // JSON is nearly a JS literal; U+2028/U+2029 are the one divergence
+  // worth escaping explicitly.
+  function jsLiteral(v) {
+    return JSON.stringify(v).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+  }
+
+  function buildCurl(req) {
+    const url = req.full_url || req.path;
+    let cmd = `curl -X ${shellQuote(req.method)}`;
+    if (req.request_headers) {
+      for (const [k, vals] of Object.entries(req.request_headers)) {
+        for (const v of vals) {
+          cmd += ` \\\n  -H ${shellQuote(k + ': ' + v)}`;
+        }
+      }
+    }
+    if (req.request_body) {
+      cmd += ` \\\n  -d ${shellQuote(req.request_body)}`;
+    }
+    cmd += ` \\\n  ${shellQuote(url)}`;
+    return cmd;
+  }
+
+  // --- Build fetch code ---
+  function buildFetch(req) {
+    const url = req.full_url || req.path;
+    let opts = { method: req.method };
+    if (req.request_headers) {
+      opts.headers = {};
+      for (const [k, vals] of Object.entries(req.request_headers)) {
+        opts.headers[k] = vals[vals.length - 1];
+      }
+    }
+    if (req.request_body) {
+      opts.body = req.request_body;
+    }
+    let code = `fetch(${jsLiteral(url)}`;
+    if (req.method !== 'GET' || opts.headers) {
+      code += `, ${jsLiteral(opts)}`;
+    }
+    code += `)\n  .then(r => r.text())\n  .then(console.log)`;
+    return code;
+  }
+
+  // --- Build wget command ---
+  function buildWget(req) {
+    const url = req.full_url || req.path;
+    let cmd = `wget --method=${shellQuote(req.method)}`;
+    if (req.request_headers) {
+      for (const [k, vals] of Object.entries(req.request_headers)) {
+        for (const v of vals) {
+          cmd += ` \\\n  --header=${shellQuote(k + ': ' + v)}`;
+        }
+      }
+    }
+    if (req.request_body) {
+      cmd += ` \\\n  --body-data=${shellQuote(req.request_body)}`;
+    }
+    cmd += ` \\\n  -O - ${shellQuote(url)}`;
+    return cmd;
+  }
+
+  // --- Filters ---
+  function matchesFilters(r) {
+    if (activeMethodFilters.size && !activeMethodFilters.has(r.method)) return false;
+    if (activeStatusFilters.size) {
+      const bucket = Math.floor(r.response_status / 100) + 'xx';
+      if (!activeStatusFilters.has(bucket)) return false;
+    }
+    if (searchQuery && !r.path.toLowerCase().includes(searchQuery)) return false;
+    return true;
+  }
+
+  document.getElementById('filterBar').addEventListener('click', e => {
+    const pill = e.target.closest('.filter-pill');
+    if (!pill) return;
+
+    if (pill.dataset.method) {
+      const m = pill.dataset.method;
+      if (activeMethodFilters.has(m)) { activeMethodFilters.delete(m); pill.classList.remove('active'); }
+      else { activeMethodFilters.add(m); pill.classList.add('active'); }
+    } else if (pill.dataset.status) {
+      const s = pill.dataset.status;
+      const colorCls = s === '2xx' ? 'active-green' : s === '4xx' ? 'active-orange' : s === '5xx' ? 'active-red' : 'active';
+      if (activeStatusFilters.has(s)) { activeStatusFilters.delete(s); pill.classList.remove(colorCls); }
+      else { activeStatusFilters.add(s); pill.classList.add(colorCls); }
+    }
+    loadRequests();
+  });
+
+  document.getElementById('filterSearch').addEventListener('input', e => {
+    searchQuery = e.target.value.toLowerCase();
+    loadRequests();
+  });
+
+  // --- Polling ---
+  loadTunnels();
+  setInterval(() => {
+    loadTunnels();
+    if (activeTunnelID) loadRequests();
+  }, 2000);
+})();
+
+// Global copy function (called from onclick)
+function copyText(btn, elementId) {
+  const text = document.getElementById(elementId).textContent;
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+  });
+}
+</script>
+</body>
+</html>

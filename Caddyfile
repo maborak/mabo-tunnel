@@ -1,0 +1,24 @@
+{
+	auto_https disable_redirects
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+http://*.tunnel.example.com, http://tunnel.example.com,
+*.tunnel.example.com, tunnel.example.com {
+	reverse_proxy mabo-tunnel:8080 {
+		transport http {
+			versions 1.1
+		}
+
+		# Flush every write straight through. Caddy's streaming auto-detection
+		# is a heuristic, and most of what this tunnel carries (SSE, chunked
+		# responses, LLM token streams) depends on not being buffered.
+		flush_interval -1
+	}
+
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+	}
+}

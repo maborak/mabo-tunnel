@@ -1,0 +1,35 @@
+# Normalize line endings so a Windows contributor does not turn every file into
+# a diff. Checked in as LF, checked out per-platform.
+* text=auto eol=lf
+
+# Shell scripts and Makefiles must stay LF even on Windows checkouts.
+*.sh        text eol=lf
+Makefile    text eol=lf
+Dockerfile* text eol=lf
+Caddyfile   text eol=lf
+
+# Go sources are always LF; gofmt assumes it.
+*.go text eol=lf diff=golang
+
+# Windows-only files keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary — never diff, never touch line endings.
+*.png  binary
+*.jpg  binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.gz   binary
+*.zip  binary
+
+# Keep generated and vendored noise out of language statistics and diffs.
+go.sum          linguist-generated=true
+*.pb.go         linguist-generated=true
+*_generated.go  linguist-generated=true
+
+
+# Documentation counts as documentation, not as code.
+docs/**  linguist-documentation=true
+*.md     linguist-documentation=true

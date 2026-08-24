@@ -1,0 +1,17 @@
+# Keep the build context to source only. Without this the whole repository —
+# git history, .env with the DNS API token, cached certificates — ships to the
+# daemon on every build.
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+build/
+data/certs/
+data/users.txt
+tests/
+docs/
+*.md
+Dockerfile*
+docker-compose.yml
+Caddyfile

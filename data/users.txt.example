@@ -1,0 +1,9 @@
+# Mabo Tunnel Users
+# Format: sha256:<hex>:username:plan
+# Plans: free (1 tunnel, rate limited), pro (unlimited tunnels)
+#
+# Add users with: mabo-tunnel-token generate <username> [free|pro] >> data/users.txt
+# The token is printed once, to stderr. It cannot be recovered from this file.
+
+sha256:c6e10d0dc8b822097c87ad06e68bd90cb71dcef5f8f54a9034ab6aeb35999afc:demo:free
+sha256:ad8eaa5db7a40c8896ca3cb43458831e5b0be356d1fd941407339cabdb396834:example:pro
