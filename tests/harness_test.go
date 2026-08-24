@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maborak/mabo-tunnel/internal/server"
 	"github.com/gorilla/websocket"
+	"github.com/maborak/mabo-tunnel/internal/server"
 )
 
 // The suite runs entirely in-process. Previously it dialed the live

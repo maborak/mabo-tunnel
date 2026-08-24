@@ -14,9 +14,9 @@ import (
 	"sync"
 	"syscall"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/maborak/mabo-tunnel/internal/client"
 	"github.com/maborak/mabo-tunnel/internal/config"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 type portEntry struct {

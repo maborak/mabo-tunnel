@@ -9,11 +9,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/caddyserver/certmagic"
+	"github.com/libdns/cloudflare"
 	"github.com/maborak/mabo-tunnel/internal/auth"
 	"github.com/maborak/mabo-tunnel/internal/protocol"
 	"github.com/maborak/mabo-tunnel/internal/version"
-	"github.com/caddyserver/certmagic"
-	"github.com/libdns/cloudflare"
 
 	"github.com/gorilla/websocket"
 )

@@ -9,8 +9,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/maborak/mabo-tunnel/internal/protocol"
 	"github.com/gorilla/websocket"
+	"github.com/maborak/mabo-tunnel/internal/protocol"
 )
 
 func testLogger() *slog.Logger {

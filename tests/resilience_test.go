@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/maborak/mabo-tunnel/internal/client"
 	"github.com/maborak/mabo-tunnel/internal/protocol"
-	"github.com/gorilla/websocket"
 )
 
 // A tunnel that dies while a worker streams a quiet response (headers sent,

@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maborak/mabo-tunnel/internal/server"
 	"github.com/gorilla/websocket"
+	"github.com/maborak/mabo-tunnel/internal/server"
 )
 
 // These are edge-case tests against an in-process server, not probes against a

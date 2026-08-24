@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/maborak/mabo-tunnel/internal/protocol"
 	"github.com/gorilla/websocket"
+	"github.com/maborak/mabo-tunnel/internal/protocol"
 )
 
 // Plan limits for tunnel quotas.
