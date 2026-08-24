@@ -1,7 +1,7 @@
 # The base image matches the toolchain go.mod requires. With a lower base,
 # GOTOOLCHAIN=auto would download a second toolchain during every build —
 # a network dependency inside the build, and a non-reproducible result.
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 ENV GOTOOLCHAIN=local
 WORKDIR /app
