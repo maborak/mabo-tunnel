@@ -103,7 +103,7 @@ cd mabo-tunnel
 make build      # → build/mabo-tunnel-server, build/mabo-tunnel-client, build/mabo-tunnel-token
 ```
 
-Requires Go 1.24+; `go.mod` targets 1.26.1 and `GOTOOLCHAIN=auto` will fetch it.
+Requires Go 1.26+; `go.mod` targets 1.26.6 and `GOTOOLCHAIN=auto` will fetch it.
 
 > [!IMPORTANT]
 > Binaries built from this repository default to a **local** server

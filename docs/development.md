@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- **Go 1.26+.** `go.mod` declares `go 1.26.1`; the Docker build uses
+- **Go 1.26+.** `go.mod` declares `go 1.26.6`; the Docker build uses
   `golang:1.26-alpine` with `GOTOOLCHAIN=local`.
 
 ## Build & run

@@ -19,7 +19,7 @@ New to the codebase? [`docs/architecture.md`](docs/architecture.md) is the
 fastest orientation: the package layering, the wire protocol, the concurrency
 model, and the traps.
 
-You need **Go 1.24+** (`go.mod` targets 1.26.1 and `GOTOOLCHAIN=auto` will
+You need **Go 1.26+** (`go.mod` targets 1.26.6 and `GOTOOLCHAIN=auto` will
 fetch it). No other system dependencies for a normal build.
 
 ## Before you open a PR

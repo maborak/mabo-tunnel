@@ -1,6 +1,6 @@
 module github.com/maborak/mabo-tunnel
 
-go 1.26.1
+go 1.26.6
 
 require (
 	github.com/caddyserver/certmagic v0.25.2
