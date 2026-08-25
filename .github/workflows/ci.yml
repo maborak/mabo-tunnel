@@ -102,19 +102,13 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
-  # Proves the release matrix compiles before a tag does, so a broken target is
-  # caught on the PR rather than during a release.
-  cross-compile:
-    name: Cross-compile
+  # Proves the release pipeline works before a tag does: validates
+  # .goreleaser.yml AND builds every release target (a superset of the old
+  # cross-compile matrix), so a broken config or target is caught on the PR
+  # rather than during a release.
+  goreleaser-check:
+    name: GoReleaser check
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - { goos: linux, goarch: amd64 }
-          - { goos: linux, goarch: arm64 }
-          - { goos: darwin, goarch: amd64 }
-          - { goos: darwin, goarch: arm64 }
-          - { goos: windows, goarch: amd64 }
     steps:
       - uses: actions/checkout@v4
 
@@ -123,12 +117,14 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build server and client
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
-        run: |
-          go build ./cmd/server
-          go build ./cmd/client
-          go build ./cmd/token
+      - name: Validate config
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: check
+
+      - name: Snapshot-build all targets
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: build --snapshot --clean

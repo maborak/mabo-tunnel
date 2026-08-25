@@ -129,6 +129,17 @@ a scoped replacement, and review the zone's audit log for records you did not
 create. Hashed user entries need no action; plaintext ones do — rotate every
 token that was in an unhashed file.
 
+## Self-update trust model
+
+`--upgrade` verifies a downloaded binary against the release's `SHA256SUMS.txt`.
+That protects against truncated or corrupted downloads — it does **not** protect
+against a compromised release pipeline, because the checksum file travels over
+the same channel (and comes from the same signer) as the binary itself. Treat a
+compromised release as game over for self-updating installs, exactly as it would
+be for manual downloads. There is no code signing or notarization. An optional
+`GH_TOKEN`/`GITHUB_TOKEN` environment variable raises the GitHub API rate limit
+and is required while this repository is private.
+
 ## Reporting
 
 See [`SECURITY.md`](../SECURITY.md) at the repository root for the reporting

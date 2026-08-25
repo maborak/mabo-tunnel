@@ -11,6 +11,8 @@ import (
 	"syscall"
 
 	"github.com/maborak/mabo-tunnel/internal/server"
+	"github.com/maborak/mabo-tunnel/internal/upgrade"
+	"github.com/maborak/mabo-tunnel/internal/version"
 )
 
 // Build-time defaults. The compiled-in values are deliberately local-only so a
@@ -63,7 +65,31 @@ func main() {
 	flag.StringVar(&cfg.AIOCFToken, "aio-cf-token", envOrDefault("CF_API_TOKEN", ""), "Cloudflare API token for DNS-01 challenge (AIO mode)")
 	flag.StringVar(&cfg.AIOCertPath, "aio-cert-path", envOrDefault("MABO_TUNNEL_AIO_CERT_PATH", defaultAIOCertPath), "Certificate storage path (AIO mode)")
 
+	showVer := flag.Bool("version", false, "Print version and exit")
+	doUpgrade := flag.Bool("upgrade", false, "Self-update this binary from GitHub Releases, then exit")
+	forceUpgrade := flag.Bool("force-upgrade", false, "With --upgrade: reinstall even if already up to date")
 	flag.Parse()
+
+	// Informational modes short-circuit before config resolution and AIO
+	// validation — --upgrade needs no domain, users file or ACME email.
+	if *showVer {
+		fmt.Println(version.Version)
+		return
+	}
+	if *doUpgrade && embeddedAIO && !*forceUpgrade {
+		fmt.Fprintln(os.Stderr, "Error: this is an AIO build carrying embedded operator config "+
+			"(domain, users, certs). --upgrade would replace it with a stock release binary and "+
+			"lose that config at restart. Re-run the embed-secrets flow instead, "+
+			"or pass --force-upgrade to accept.")
+		os.Exit(1)
+	}
+	if *doUpgrade {
+		os.Exit(upgrade.CLI(context.Background(), upgrade.Options{
+			Binary:  "server",
+			Current: version.Version,
+			Force:   *forceUpgrade,
+		}))
+	}
 
 	if trustedProxies != "" {
 		cfg.TrustedProxies = strings.Split(trustedProxies, ",")

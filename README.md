@@ -105,6 +105,19 @@ make build      # → build/mabo-tunnel-server, build/mabo-tunnel-client, build/
 
 Requires Go 1.26+; `go.mod` targets 1.26.6 and `GOTOOLCHAIN=auto` will fetch it.
 
+### Updating an installed binary
+
+Release binaries can update themselves:
+
+```bash
+mabo-tunnel-client --upgrade   # same for mabo-tunnel-server
+```
+
+This fetches the latest release, verifies the download against the release's
+`SHA256SUMS.txt`, and atomically replaces the binary in place — restart to run
+the new version. See [docs/client.md](docs/client.md#self-updating) for
+caveats (Docker, Homebrew, rate limits).
+
 > [!IMPORTANT]
 > Binaries built from this repository default to a **local** server
 > (`ws://localhost:8080`) and a **local** domain (`localhost`). They will never

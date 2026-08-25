@@ -25,10 +25,23 @@ in one of two modes:
 | `--aio-email` | `MABO_TUNNEL_AIO_EMAIL` | — | ACME email (required in AIO) |
 | `--aio-cf-token` | `CF_API_TOKEN` | — | Cloudflare API token for DNS-01 (required in AIO) |
 | `--aio-cert-path` | `MABO_TUNNEL_AIO_CERT_PATH` | `data/certs` | Certificate storage directory |
+| `--version` | — | — | Print version and exit |
+| `--upgrade` | — | — | Self-update this binary from GitHub Releases, then exit |
+| `--force-upgrade` | — | — | With `--upgrade`: reinstall even if already up to date |
 
 Precedence: **CLI flag → environment variable → built-in default**. In hardened
 AIO builds, encrypted embedded values fill in as a further fallback (see
 [security.md](security.md)).
+
+Self-update mechanics are shared with the client and documented in
+[client.md](client.md#self-updating). Two server-specific caveats:
+
+- **AIO builds refuse `--upgrade`.** A hardened AIO binary carries encrypted
+  embedded config (domain, users, certs); a stock release binary does not, so
+  upgrading would silently de-harden the deployment at next restart. Re-run the
+  embed-secrets flow instead, or pass `--force-upgrade` to accept.
+- **Docker deployments must not self-update** — rebuild the image instead (see
+  [deployment.md](deployment.md)).
 
 ## Running
 

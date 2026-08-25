@@ -16,10 +16,33 @@ your local app(s), and runs a terminal UI plus a local inspection dashboard.
 | `--config` | — | `mabo-tunnel.yml` | Path to a YAML config file |
 | `--header-add` | — | — | Add/override a header on proxied requests (`"X-Foo: bar"`), repeatable |
 | `--header-remove` | — | — | Remove a header from proxied requests (`"Cookie"`), repeatable |
+| `--version` | — | — | Print version and exit |
+| `--upgrade` | — | — | Self-update this binary from GitHub Releases, then exit |
+| `--force-upgrade` | — | — | With `--upgrade`: reinstall even if already up to date |
 
 Precedence: **CLI flag → YAML config → env var default**. `--token` and
 `--server` fall back to the config file; `--port` (or config `tunnels`) is
 required.
+
+## Self-updating
+
+```bash
+mabo-tunnel-client --upgrade
+```
+
+Downloads the latest release asset for your platform from
+[GitHub Releases](https://github.com/maborak/mabo-tunnel/releases), verifies it
+against the release's `SHA256SUMS.txt`, and atomically replaces the running
+binary. Restart afterwards to run the new version.
+
+- Needs no token, port or config file — it short-circuits before any of that.
+- Dev builds (`git describe` output, `dev`) always install the latest release.
+- The unauthenticated GitHub API allows 60 requests/hour per IP; set `GH_TOKEN`
+  to raise it to 5,000/hour. While this repository is **private**, a token is
+  required for `--upgrade` to see releases at all.
+- Do **not** use it inside Docker (the swap lives only in the container's
+  writable layer — rebuild the image instead) or for Homebrew-managed installs
+  (it would desynchronize brew).
 
 ## Port formats
 

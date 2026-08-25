@@ -17,6 +17,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/maborak/mabo-tunnel/internal/client"
 	"github.com/maborak/mabo-tunnel/internal/config"
+	"github.com/maborak/mabo-tunnel/internal/upgrade"
+	"github.com/maborak/mabo-tunnel/internal/version"
 )
 
 type portEntry struct {
@@ -52,7 +54,24 @@ func main() {
 	var headerRemoveFlags multiFlag
 	flag.Var(&headerAddFlags, "header-add", "Add/override a header on proxied requests (e.g. \"X-Foo: bar\"). Can be repeated.")
 	flag.Var(&headerRemoveFlags, "header-remove", "Remove a header from proxied requests (e.g. \"Cookie\"). Can be repeated.")
+	showVer := flag.Bool("version", false, "Print version and exit")
+	doUpgrade := flag.Bool("upgrade", false, "Self-update this binary from GitHub Releases, then exit")
+	forceUpgrade := flag.Bool("force-upgrade", false, "With --upgrade: reinstall even if already up to date")
 	flag.Parse()
+
+	// Informational modes short-circuit before any validation — --upgrade
+	// needs neither --token nor --port nor a valid config file.
+	if *showVer {
+		fmt.Println(version.Version)
+		return
+	}
+	if *doUpgrade {
+		os.Exit(upgrade.CLI(context.Background(), upgrade.Options{
+			Binary:  "client",
+			Current: version.Version,
+			Force:   *forceUpgrade,
+		}))
+	}
 
 	// Load config file if specified or if default exists.
 	var fileCfg *config.FileConfig

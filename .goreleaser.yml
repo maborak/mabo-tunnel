@@ -1,0 +1,94 @@
+version: 2
+
+project_name: mabo-tunnel
+
+before:
+  hooks:
+    - go mod tidy
+
+# The asset naming here is a CONTRACT with internal/upgrade.AssetName():
+#   mabo-tunnel-{{ .Binary }}-{{ .Os }}-{{ .Arch }}[.exe]
+# TestAssetNamesMatchGoreleaser pins the two together — change both or neither.
+builds:
+  - id: server
+    main: ./cmd/server
+    binary: server
+    env: ["CGO_ENABLED=0"]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - { goos: windows, goarch: arm64 }
+    ldflags:
+      - -s -w -X {{ .ModulePath }}/internal/version.Version={{ .Version }}
+
+  - id: client
+    main: ./cmd/client
+    binary: client
+    env: ["CGO_ENABLED=0"]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - { goos: windows, goarch: arm64 }
+    ldflags:
+      - -s -w -X {{ .ModulePath }}/internal/version.Version={{ .Version }}
+
+  - id: token
+    main: ./cmd/token
+    binary: token
+    env: ["CGO_ENABLED=0"]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - { goos: windows, goarch: arm64 }
+    ldflags:
+      - -s -w -X {{ .ModulePath }}/internal/version.Version={{ .Version }}
+
+# Binary mode: raw executables as release assets (no tarballs), so
+# `--upgrade` can download and swap them directly.
+archives:
+  - formats: [binary]
+    name_template: "mabo-tunnel-{{ .Binary }}-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: "SHA256SUMS.txt"
+  algorithm: sha256
+
+changelog:
+  use: git
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  draft: false
+  prerelease: auto # '-' anywhere in the tag marks a pre-release
+  header: |
+    ## Install
+
+    Download the binary for your platform below, or:
+
+    ```bash
+    go install github.com/maborak/mabo-tunnel/cmd/client@{{ .Tag }}
+    ```
+
+    Verify a download against `SHA256SUMS.txt`:
+
+    ```bash
+    sha256sum -c --ignore-missing SHA256SUMS.txt
+    ```
+
+    Or let the binary do it:
+
+    ```bash
+    mabo-tunnel-client --upgrade
+    ```
+
+    > **Note:** these binaries default to a **local** server
+    > (`ws://localhost:8080`). Point the client at your own deployment
+    > with `--server` or `MABO_TUNNEL_SERVER`. See
+    > [docs/deployment.md](https://github.com/maborak/mabo-tunnel/blob/main/docs/deployment.md).

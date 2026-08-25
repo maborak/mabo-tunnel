@@ -56,6 +56,15 @@ To change the domain, edit `Caddyfile` (both the site block and the `tls` line
 target the base domain) and pass `--domain` to the server via the compose
 `command:` or `MABO_TUNNEL_DOMAIN`.
 
+> [!WARNING]
+> Do **not** run `--upgrade` inside the container. The swapped binary lives only
+> in the container's writable layer and is lost when the container is recreated.
+> Upgrade by rebuilding instead:
+>
+> ```bash
+> docker compose build --pull && docker compose up -d
+> ```
+
 ### Why HTTP/1.1 to the backend
 
 The Caddy `reverse_proxy` uses `versions 1.1` so WebSocket upgrades (client
