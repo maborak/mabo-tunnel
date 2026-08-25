@@ -112,12 +112,9 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	if repo == "" {
 		repo = DefaultRepo
 	}
-	baseURL := opts.BaseURL
-	if baseURL == "" {
-		baseURL = "https://api.github.com"
-	}
+	gc := newGHClient(opts.BaseURL, opts.Client)
 
-	rel, err := fetchLatest(ctx, baseURL, owner, repo, opts.Client)
+	rel, err := gc.fetchLatest(ctx, owner, repo)
 	if err != nil {
 		return Result{}, err
 	}
@@ -151,7 +148,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		}
 	}()
 
-	if err := downloadAsset(ctx, rel, name, tmp, opts.Client); err != nil {
+	if err := gc.download(ctx, owner, repo, rel, name, tmp); err != nil {
 		return Result{}, err
 	}
 	// CreateTemp makes 0600; restore the original permission bits (including

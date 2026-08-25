@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -166,46 +167,56 @@ type fakeGH struct {
 	dlHits  atomic.Int32 // asset downloads
 }
 
-// newFakeGH serves a releases/latest JSON whose download URLs point back at
-// the same server. files maps asset names to bytes; SHA256SUMS.txt content is
-// computed unless the caller supplies its bytes explicitly (checksum-mismatch
-// tests do that).
+// newFakeGH serves a releases/latest JSON plus API-style asset downloads
+// (/releases/assets/<id> with octet-stream), mirroring how real asset
+// downloads flow through the API host so tokens work on private repos.
 func newFakeGH(t *testing.T, tag string, files map[string][]byte) *fakeGH {
 	t.Helper()
 	fg := &fakeGH{}
 	mux := http.NewServeMux()
 
+	names := make([]string, 0, len(files))
+	for n := range files {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	idByName := make(map[string]int64, len(files))
+	next := int64(1001)
+	for _, n := range names {
+		idByName[n] = next
+		next++
+	}
+
 	mux.HandleFunc("GET /repos/maborak/mabo-tunnel/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		fg.apiHits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"tag_name":%q,"assets":[`, tag)
-		first := true
-		names := make([]string, 0, len(files))
-		for n := range files {
-			names = append(names, n)
-		}
-		sort.Strings(names)
-		for _, n := range names {
-			if !first {
+		for i, n := range names {
+			if i > 0 {
 				io.WriteString(w, ",")
 			}
-			first = false
-			fmt.Fprintf(w, `{"name":%q,"size":%d,"browser_download_url":%q}`,
-				n, len(files[n]), fg.srv.URL+"/dl/"+n)
+			fmt.Fprintf(w, `{"id":%d,"name":%q,"size":%d}`, idByName[n], n, len(files[n]))
 		}
 		io.WriteString(w, `]}`)
 	})
 
-	mux.HandleFunc("GET /dl/", func(w http.ResponseWriter, r *http.Request) {
+	const assetsPrefix = "/repos/maborak/mabo-tunnel/releases/assets/"
+	mux.HandleFunc("GET "+assetsPrefix, func(w http.ResponseWriter, r *http.Request) {
 		fg.dlHits.Add(1)
-		name := strings.TrimPrefix(r.URL.Path, "/dl/")
-		data, ok := files[name]
-		if !ok {
+		id, err := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, assetsPrefix), 10, 64)
+		if err != nil {
 			http.NotFound(w, r)
 			return
 		}
-		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
-		_, _ = w.Write(data)
+		for n, want := range idByName {
+			if want == id {
+				data := files[n]
+				w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+				_, _ = w.Write(data)
+				return
+			}
+		}
+		http.NotFound(w, r)
 	})
 
 	fg.srv = httptest.NewServer(mux)
@@ -217,14 +228,14 @@ func newFakeGH(t *testing.T, tag string, files map[string][]byte) *fakeGH {
 // asserts the swap is refused with the original binary intact.
 func TestRunTruncatedDownload(t *testing.T) {
 	name := AssetName("client", runtime.GOOS, runtime.GOARCH)
+	const assetPrefixPath = "/repos/maborak/mabo-tunnel/releases/assets/"
 	fg := &fakeGH{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/maborak/mabo-tunnel/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"tag_name":"v1.1.0","assets":[{"name":%q,"size":1000,"browser_download_url":%q}]}`,
-			name, fg.srv.URL+"/dl/"+name)
+		fmt.Fprintf(w, `{"tag_name":"v1.1.0","assets":[{"id":42,"name":%q,"size":1000}]}`, name)
 	})
-	mux.HandleFunc("GET /dl/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+assetPrefixPath, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "1000") // promise more than we send
 		_, _ = w.Write([]byte("short body"))
 	})
@@ -262,7 +273,8 @@ func TestFetchLatestStatuses(t *testing.T) {
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
 		srv := httptest.NewServer(mux)
 		defer srv.Close()
-		_, err := fetchLatest(ctx, srv.URL, DefaultOwner, DefaultRepo, srv.Client())
+		gc := newGHClient(srv.URL, srv.Client())
+		_, err := gc.fetchLatest(ctx, DefaultOwner, DefaultRepo)
 		if !errors.Is(err, ErrNoReleases) {
 			t.Fatalf("err = %v, want ErrNoReleases", err)
 		}
@@ -277,7 +289,8 @@ func TestFetchLatestStatuses(t *testing.T) {
 		})
 		srv := httptest.NewServer(mux)
 		defer srv.Close()
-		_, err := fetchLatest(ctx, srv.URL, DefaultOwner, DefaultRepo, srv.Client())
+		gc := newGHClient(srv.URL, srv.Client())
+		_, err := gc.fetchLatest(ctx, DefaultOwner, DefaultRepo)
 		if !errors.Is(err, ErrRateLimited) {
 			t.Fatalf("err = %v, want ErrRateLimited", err)
 		}
@@ -293,7 +306,8 @@ func TestFetchLatestStatuses(t *testing.T) {
 		})
 		srv := httptest.NewServer(mux)
 		defer srv.Close()
-		_, err := fetchLatest(ctx, srv.URL, DefaultOwner, DefaultRepo, srv.Client())
+		gc := newGHClient(srv.URL, srv.Client())
+		_, err := gc.fetchLatest(ctx, DefaultOwner, DefaultRepo)
 		if err == nil || !strings.Contains(err.Error(), "500") {
 			t.Fatalf("err = %v, want status code in message", err)
 		}

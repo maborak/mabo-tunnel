@@ -48,9 +48,9 @@ var (
 )
 
 type ghAsset struct {
-	Name               string `json:"name"`
-	Size               int64  `json:"size"`
-	BrowserDownloadURL string `json:"browser_download_url"`
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
 }
 
 type ghRelease struct {
@@ -58,44 +58,63 @@ type ghRelease struct {
 	Assets  []ghAsset `json:"assets"`
 }
 
-// apiClient returns the HTTP client to use, defaulting sensibly.
-func apiClient(hc *http.Client) *http.Client {
-	if hc != nil {
-		return hc
-	}
-	return &http.Client{Timeout: apiTimeout}
+// ghClient talks to one GitHub API host. Assets are downloaded through the
+// API's octet-stream endpoint rather than browser_download_url: the browser
+// URL 404s for private repos without an interactive session, while the API
+// endpoint honors a bearer token (and works anonymously for public ones).
+type ghClient struct {
+	base string // e.g. https://api.github.com (override for tests)
+	hc   *http.Client
 }
 
-func decodeJSON(r io.Reader, v any) error {
-	return json.NewDecoder(r).Decode(v)
+func newGHClient(baseURL string, hc *http.Client) *ghClient {
+	if baseURL == "" {
+		baseURL = "https://api.github.com"
+	}
+	if hc == nil {
+		hc = &http.Client{Timeout: apiTimeout}
+	}
+	return &ghClient{base: strings.TrimSuffix(baseURL, "/"), hc: hc}
 }
 
-// fetchLatest GETs /releases/latest for owner/repo against baseURL (override
-// for tests). An optional GH_TOKEN or GITHUB_TOKEN env var is sent as a bearer
-// token to lift the unauthenticated rate limit.
-func fetchLatest(ctx context.Context, baseURL, owner, repo string, hc *http.Client) (*ghRelease, error) {
-	c := apiClient(hc)
-	reqCtx, cancel := context.WithTimeout(ctx, apiTimeout)
-	defer cancel()
-
-	url := strings.TrimSuffix(baseURL, "/") + "/repos/" + owner + "/" + repo + "/releases/latest"
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
+func (g *ghClient) token() string {
 	tok := os.Getenv("GH_TOKEN")
 	if tok == "" {
 		tok = os.Getenv("GITHUB_TOKEN")
 	}
-	if tok != "" {
+	return tok
+}
+
+// do performs an authenticated GET against the API host. The returned cancel
+// MUST be called only after the response body has been fully consumed —
+// canceling earlier aborts the in-flight body read.
+func (g *ghClient) do(ctx context.Context, path, accept string, timeout time.Duration) (*http.Response, func(), error) {
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, g.base+path, nil)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	req.Header.Set("Accept", accept)
+	if tok := g.token(); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
+	resp, err := g.hc.Do(req)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return resp, cancel, nil
+}
 
-	resp, err := c.Do(req)
+// fetchLatest GETs /releases/latest for owner/repo.
+func (g *ghClient) fetchLatest(ctx context.Context, owner, repo string) (*ghRelease, error) {
+	resp, cancel, err := g.do(ctx, "/repos/"+owner+"/"+repo+"/releases/latest", "application/vnd.github+json", apiTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("contact github: %w", err)
 	}
+	defer cancel()
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
@@ -119,7 +138,7 @@ func fetchLatest(ctx context.Context, baseURL, owner, repo string, hc *http.Clie
 	}
 
 	var rel ghRelease
-	if err := decodeJSON(resp.Body, &rel); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
 		return nil, fmt.Errorf("decode release: %w", err)
 	}
 	return &rel, nil
@@ -150,10 +169,10 @@ func parseChecksums(data []byte) map[string]string {
 	return out
 }
 
-// downloadAsset streams the named asset into dst, verifying size and sha256.
-// On any failure dst is left for the caller's cleanup and the error explains
-// what went wrong; the original binary on disk is never touched here.
-func downloadAsset(ctx context.Context, rel *ghRelease, name string, dst io.Writer, hc *http.Client) error {
+// download streams the given asset into dst, verifying size and sha256 against
+// the release's SHA256SUMS.txt. On any failure the error explains what went
+// wrong; the original binary on disk is never touched here.
+func (g *ghClient) download(ctx context.Context, owner, repo string, rel *ghRelease, name string, dst io.Writer) error {
 	a, err := findAsset(rel, name)
 	if err != nil {
 		return err
@@ -161,23 +180,16 @@ func downloadAsset(ctx context.Context, rel *ghRelease, name string, dst io.Writ
 	if a.Size > maxBinaryBytes {
 		return fmt.Errorf("asset %s is %d bytes (limit %d) — refusing", name, a.Size, int64(maxBinaryBytes))
 	}
-
-	// Shallow-copy so the caller's client (and its Transport for tests) is
-	// preserved while the download gets the longer timeout.
-	dc := *apiClient(hc)
-	dc.Timeout = dlTimeout
-	c := &dc
-	reqCtx, cancel := context.WithTimeout(ctx, dlTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, a.BrowserDownloadURL, nil)
-	if err != nil {
-		return fmt.Errorf("build download request: %w", err)
+	if a.ID == 0 {
+		return fmt.Errorf("asset %s has no API id (cannot download)", name)
 	}
-	resp, err := c.Do(req)
+
+	path := "/repos/" + owner + "/" + repo + "/releases/assets/" + strconv.FormatInt(a.ID, 10)
+	resp, cancel, err := g.do(ctx, path, "application/octet-stream", dlTimeout)
 	if err != nil {
 		return fmt.Errorf("download %s: %w", name, err)
 	}
+	defer cancel()
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download %s: server returned %s", name, resp.Status)
@@ -192,7 +204,7 @@ func downloadAsset(ctx context.Context, rel *ghRelease, name string, dst io.Writ
 		return fmt.Errorf("download %s incomplete: got %d of %d bytes", name, n, a.Size)
 	}
 
-	sums, err := fetchChecksums(ctx, rel, hc)
+	sums, err := g.fetchChecksums(ctx, owner, repo, rel)
 	if err != nil {
 		return err
 	}
@@ -207,23 +219,21 @@ func downloadAsset(ctx context.Context, rel *ghRelease, name string, dst io.Writ
 }
 
 // fetchChecksums downloads and parses SHA256SUMS.txt from the release.
-func fetchChecksums(ctx context.Context, rel *ghRelease, hc *http.Client) (map[string]string, error) {
+func (g *ghClient) fetchChecksums(ctx context.Context, owner, repo string, rel *ghRelease) (map[string]string, error) {
 	a, err := findAsset(rel, checksumsNm)
 	if err != nil {
 		return nil, fmt.Errorf("release has no %s asset", checksumsNm)
 	}
-	c := apiClient(hc)
-	reqCtx, cancel := context.WithTimeout(ctx, apiTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, a.BrowserDownloadURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build checksum request: %w", err)
+	if a.ID == 0 {
+		return nil, fmt.Errorf("asset %s has no API id (cannot download)", checksumsNm)
 	}
-	resp, err := c.Do(req)
+
+	path := "/repos/" + owner + "/" + repo + "/releases/assets/" + strconv.FormatInt(a.ID, 10)
+	resp, cancel, err := g.do(ctx, path, "application/octet-stream", apiTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("download %s: %w", checksumsNm, err)
 	}
+	defer cancel()
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("download %s: server returned %s", checksumsNm, resp.Status)
