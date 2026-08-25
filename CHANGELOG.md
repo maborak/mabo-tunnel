@@ -5,6 +5,15 @@ All notable changes to Mabo Tunnel are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-08-25
+
+### Fixed
+
+- `--upgrade` on private repositories: release assets are now downloaded through
+  the GitHub API (which honors `GH_TOKEN`) instead of the browser download URL,
+  and a request-lifecycle bug that aborted every binary download with "context
+  canceled" is fixed.
+
 ## [1.1.0] - 2026-08-25
 
 ### Added
