@@ -26,7 +26,7 @@ func startTunnelTo(t *testing.T, localPort int, subdomain string) string {
 		Token:     proToken,
 		LocalPort: localPort,
 		Subdomain: subdomain,
-	}, client.NewDisplay(1), nil, nil)
+	}, client.NewDisplay(), nil, nil)
 
 	readyCh := make(chan string, 1)
 	cl.OnReady = func(url string) { readyCh <- url }

@@ -23,7 +23,15 @@ in one of two modes:
 | `--aio` | — | `false` | All-in-one mode: HTTP `:80` + HTTPS `:443` + auto certs |
 | `--aio-bind` | `MABO_TUNNEL_AIO_BIND` | `0.0.0.0` | Bind IP in AIO mode |
 | `--aio-email` | `MABO_TUNNEL_AIO_EMAIL` | — | ACME email (required in AIO) |
-| `--aio-cf-token` | `CF_API_TOKEN` | — | Cloudflare API token for DNS-01 (required in AIO) |
+| `--aio-cf-token` | `CF_API_TOKEN` | — | DNS provider credential for DNS-01 (required in AIO): Cloudflare token, DigitalOcean token, or AWS Access Key ID |
+| `--aio-dns-provider` | `MABO_TUNNEL_AIO_DNS_PROVIDER` | `cloudflare` | DNS-01 provider: `cloudflare`, `digitalocean`, `route53` |
+| `--aio-dns-secret` | `MABO_TUNNEL_AIO_DNS_SECRET` | — | Provider's second credential (AWS Secret Access Key; unused otherwise) |
+| `--custom-domains` | `MABO_TUNNEL_CUSTOM_DOMAINS` | — | Zone suffixes users may register verified custom hostnames under |
+| `--admin-token` | `MABO_TUNNEL_ADMIN_TOKEN` | — | Enable `/admin/*` and `/metrics`, guarded by this bearer token |
+| `--plan-free-tunnels` | `MABO_TUNNEL_PLAN_FREE_TUNNELS` | `1` | Free-plan concurrent tunnels (per-user override wins) |
+| `--plan-pro-tunnels` | `MABO_TUNNEL_PLAN_PRO_TUNNELS` | `10` | Pro-plan concurrent tunnels (per-user override wins) |
+| `--tunnel-rps` | `MABO_TUNNEL_TUNNEL_RPS` | off | Per-tunnel request-rate cap (req/s), token bucket at the edge |
+| `--tunnel-burst` | `MABO_TUNNEL_TUNNEL_BURST` | =rps | Instant burst allowed above the per-tunnel rate |
 | `--aio-cert-path` | `MABO_TUNNEL_AIO_CERT_PATH` | `data/certs` | Certificate storage directory |
 | `--version` | — | — | Print version and exit |
 | `--upgrade` | — | — | Self-update this binary from GitHub Releases, then exit |
@@ -174,6 +182,53 @@ When a client connects with `--protocol=tcp`, the server allocates a port from
 `[--tcp-port-min, --tcp-port-max]`, listens on it, and relays raw bytes both
 ways over the WebSocket. The public endpoint is `tcp://{domain}:{port}`. Make
 sure that port range is open in your firewall / security group.
+
+## Admin API & metrics
+
+Set `--admin-token` to enable. Requests authenticate with
+`Authorization: Bearer <token>` (or `X-Admin-Token: <token>`); anything else —
+including no token at all, when the flag is unset — gets `404`, so existence of
+the API is not even probeable.
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/admin/tunnels` | GET | Active tunnels: IDs, subdomains/hosts, users, plans, in-flight counts |
+| `/admin/tunnels/{id}` | DELETE | Revoke a tunnel immediately; no reconnect reservation is granted |
+| `/admin/users/reload` | POST | Reload the users file (see below) |
+| `/admin/stats` | GET | Version, domain, uptime, user/tunnel counts |
+| `/metrics` | GET | Prometheus text-format metrics |
+
+Metrics include `mabo_tunnels_active`, `mabo_users_loaded`,
+`mabo_tunnels_registered_total`, `mabo_auth_attempts_total`,
+`mabo_auth_failures_total`, and `mabo_http_responses_total{status="2xx"…}`.
+
+## Hot-reloading users
+
+The users file is watched: changes are picked up within ~5 seconds, and
+`SIGHUP` forces an immediate reload. A reload that fails to parse (a half-edited
+file, a stray character) logs the error and keeps the previously loaded users.
+AIO builds carry their users embedded and encrypted, so reloading does not
+apply to them — rebuild instead.
+
+## Custom domains
+
+With `--custom-domains=apps.example.com,…` a client may register a hostname
+under one of those zones (`alice.apps.example.com`) by proving control before
+the tunnel opens: a TXT record `_mabo-challenge.<domain>` must equal
+`sha256("<sha256-of-token-hex>.<domain>")`. Only someone holding the real token
+can compute it; the server knows just the token hash and verifies against that.
+
+In AIO mode the TXT lookup goes through the configured DNS provider's API (so
+the same credential must be able to read that zone), and certificates for
+verified domains are issued on demand — issuance is refused for any name that
+is not an active custom domain. In plain mode verification resolves through
+public DNS, and TLS is whatever your reverse proxy provides.
+
+## Rate limiting
+
+`--tunnel-rps=N` gives every tunnel its own token bucket (`--tunnel-burst`
+allows a short instant burst). Over-limit public requests receive `429` with
+`Retry-After`. TCP tunnels are not shaped by this cap.
 
 ## Shutdown
 

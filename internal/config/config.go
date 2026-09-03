@@ -15,10 +15,13 @@ type HeaderConfig struct {
 
 // TunnelConfig defines a single tunnel in the YAML config.
 type TunnelConfig struct {
-	Port    int          `yaml:"port"`
-	Host    string       `yaml:"host,omitempty"` // forward target host (default: localhost)
-	Auth    string       `yaml:"auth,omitempty"` // "user:pass" for HTTP Basic Auth
-	Headers HeaderConfig `yaml:"headers,omitempty"`
+	Port         int          `yaml:"port"`
+	Host         string       `yaml:"host,omitempty"` // forward target host (default: localhost)
+	Auth         string       `yaml:"auth,omitempty"` // "user:pass" for HTTP Basic Auth
+	CustomDomain string       `yaml:"custom_domain,omitempty"`
+	Headers      HeaderConfig `yaml:"headers,omitempty"`
+	AllowIPs     []string     `yaml:"allow_ips,omitempty"` // CIDRs/IPs allowed to reach this tunnel
+	DenyIPs      []string     `yaml:"deny_ips,omitempty"`  // CIDRs/IPs blocked from this tunnel (checked first)
 }
 
 // FileConfig represents the full mabo-tunnel.yml configuration file.

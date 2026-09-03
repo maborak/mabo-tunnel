@@ -68,7 +68,7 @@ func TestClientReconnectsWhenTunnelDiesMidStream(t *testing.T) {
 		Token:     "anything",
 		LocalPort: extractPort(backend.URL),
 	}
-	c := client.New(cfg, client.NewDisplay(1), nil, nil)
+	c := client.New(cfg, client.NewDisplay(), nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go c.Run(ctx)

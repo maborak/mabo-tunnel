@@ -138,21 +138,23 @@ Every message is wrapped:
 ### AuthRequest
 
 ```go
-Token      string   // required
-Subdomain  string   // request a specific subdomain (single tunnel only)
-SessionID  string   // stable across reconnects; drives subdomain reservation
-Name       string   // named tunnel → subdomain "username-name"
-Graceful   bool     // set on clean shutdown
-Protocol   string   // "http" (default) or "tcp"
-AllowedIPs []string // IP allow list — enforced by server, NOT set by the bundled CLI
-DeniedIPs  []string // IP deny list  — enforced by server, NOT set by the bundled CLI
-BasicAuth  string   // "user:pass" — HTTP Basic Auth on the tunnel
+Token        string   // required
+Subdomain    string   // request a specific subdomain (single tunnel only)
+SessionID    string   // stable across reconnects; drives subdomain reservation
+Name         string   // named tunnel → subdomain "username-name"
+Graceful     bool     // set on clean shutdown
+Protocol     string   // "http" (default) or "tcp"
+AllowedIPs   []string // IP allow list, CIDRs or bare IPs (max 32 entries)
+DeniedIPs    []string // IP deny list — checked before the allow list
+BasicAuth    string   // "user:pass" — HTTP Basic Auth on the tunnel
+CustomDomain string   // hostname to serve after TXT ownership verification
 ```
 
-> `AllowedIPs` / `DeniedIPs` are honored by the server
-> (`http_proxy.go:checkIPAccess`) but the shipped client never populates them —
-> there is no CLI flag or YAML key. To use IP filtering today you would send a
-> custom `auth_request`. Wiring a `--allow` / `--deny` flag is on the roadmap.
+> `AllowedIPs` / `DeniedIPs` are normalized at the handshake: bare IPs become
+> `/32` (or `/128`), invalid entries reject the auth with a clear message. The
+> edge matches them as CIDR networks via `Tunnel.allowedNets` / `deniedNets`.
+> `CustomDomain` must fall under a server-enabled zone (`--custom-domains`) and
+> is verified via the `_mabo-challenge.<domain>` TXT record before registration.
 
 ### AuthResponse
 

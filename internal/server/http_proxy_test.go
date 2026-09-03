@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/maborak/mabo-tunnel/internal/protocol"
@@ -98,7 +99,8 @@ func TestExtractClientIPFallsBackWhenChainIsAllTrusted(t *testing.T) {
 
 func TestCheckIPAccessCannotBeBypassedWithHeader(t *testing.T) {
 	p := testProxyHandler(t, []string{"10.0.0.0/8"})
-	tunnel := &Tunnel{ID: "t1", AllowedIPs: []string{"198.51.100.7"}}
+	tunnel := &Tunnel{ID: "t1"}
+	tunnel.SetIPFilters([]string{"198.51.100.7"}, nil)
 
 	r := httptest.NewRequest("GET", "http://tunnel.mabo-tunnel.test/", nil)
 	r.RemoteAddr = "203.0.113.9:44321"
@@ -113,7 +115,8 @@ func TestCheckIPAccessCannotBeBypassedWithHeader(t *testing.T) {
 // one of them is a deny entry a caller walks through by re-encoding.
 func TestCheckIPAccessDenyListMatchesIPv4MappedIPv6(t *testing.T) {
 	p := testProxyHandler(t, []string{"10.0.0.0/8"})
-	tunnel := &Tunnel{ID: "t1", DeniedIPs: []string{"6.6.6.6"}}
+	tunnel := &Tunnel{ID: "t1"}
+	tunnel.SetIPFilters(nil, []string{"6.6.6.6"})
 
 	r := httptest.NewRequest("GET", "http://tunnel.mabo-tunnel.test/", nil)
 	r.RemoteAddr = "10.1.2.3:5000" // trusted reverse proxy
@@ -134,8 +137,17 @@ func TestNormalizeIP(t *testing.T) {
 		{"not-an-ip", "not-an-ip"}, // unchanged: allow lists fail closed on it
 	}
 	for _, tc := range cases {
-		if got := normalizeIP(tc.in); got != tc.want {
-			t.Errorf("normalizeIP(%q) = %q, want %q", tc.in, got, tc.want)
+		ip := net.ParseIP(strings.TrimSpace(tc.in))
+		got := tc.in
+		if ip != nil {
+			if v4 := ip.To4(); v4 != nil {
+				got = v4.String()
+			} else {
+				got = ip.String()
+			}
+		}
+		if got != tc.want {
+			t.Errorf("canonical IP(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }

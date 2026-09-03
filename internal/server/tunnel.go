@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,10 +16,45 @@ import (
 	"github.com/maborak/mabo-tunnel/internal/protocol"
 )
 
-// Plan limits for tunnel quotas.
-var PlanLimits = map[string]int{
+// DefaultPlanLimits are the concurrent-tunnel quotas used when the server does
+// not override them with --plan-free-tunnels / --plan-pro-tunnels.
+var DefaultPlanLimits = map[string]int{
 	"free": 1,
 	"pro":  10,
+}
+
+// planLimit resolves the effective tunnel quota for a registration: a per-user
+// override wins, then the configured plan limit, then 1.
+func (m *TunnelManager) planLimit(plan string, userOverride int) int {
+	if userOverride > 0 {
+		return userOverride
+	}
+	if n, ok := m.planLimits[plan]; ok && n > 0 {
+		return n
+	}
+	return 1
+}
+
+// SetPlanLimits overrides the per-plan tunnel quotas.
+func (m *TunnelManager) SetPlanLimits(free, pro int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if free > 0 {
+		m.planLimits["free"] = free
+	}
+	if pro > 0 {
+		m.planLimits["pro"] = pro
+	}
+}
+
+// SetRateLimit configures the per-tunnel public request-rate cap. rps <= 0
+// disables limiting. Every subsequently registered tunnel gets its own bucket;
+// existing tunnels keep theirs.
+func (m *TunnelManager) SetRateLimit(rps, burst int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rateLimitRPS = rps
+	m.rateLimitBurst = burst
 }
 
 // tunnelWriteTimeout bounds a single WebSocket write to the tunnel client.
@@ -38,6 +75,19 @@ type Tunnel struct {
 	BasicAuth   string   // "user:pass" for HTTP Basic Auth (empty = no auth)
 	Binary      bool     // client negotiated binary data frames
 	Conn        *websocket.Conn
+
+	// allowedNets / deniedNets are the CIDR forms of the lists above, parsed
+	// once at registration so the per-request path is a Contains() walk, not
+	// a re-parse of every entry.
+	allowedNets []*net.IPNet
+	deniedNets  []*net.IPNet
+
+	// rateLimiter caps this tunnel's public request rate. Nil = unlimited.
+	rateLimiter *tokenBucket
+
+	// CustomHost is a verified custom hostname serving this tunnel (HTTP
+	// tunnels only). Empty for standard subdomain tunnels.
+	CustomHost string
 
 	// tcpListener is the TCP listener for TCP tunnels (nil for HTTP).
 	tcpListener net.Listener
@@ -422,6 +472,19 @@ type TunnelManager struct {
 	stopCh   chan struct{}
 	stopOnce sync.Once
 
+	// planLimits holds the concurrent-tunnel quota per plan, copied from
+	// DefaultPlanLimits and overridable via SetPlanLimits.
+	planLimits map[string]int
+
+	// rateLimitRPS / rateLimitBurst configure the per-tunnel token bucket.
+	// Zero RPS disables edge rate limiting entirely (the default).
+	rateLimitRPS   int
+	rateLimitBurst int
+
+	// byCustom maps a registered custom hostname (lowercased, no trailing
+	// dot) to its tunnel. Verified at registration via TXT challenge.
+	byCustom map[string]*Tunnel
+
 	// TCP port allocation
 	tcpPortMin int            // start of TCP port range (inclusive)
 	tcpPortMax int            // end of TCP port range (inclusive)
@@ -433,11 +496,13 @@ func NewTunnelManager(domain string, tcpPortMin, tcpPortMax int, logger *slog.Lo
 	tm := &TunnelManager{
 		tunnels:    make(map[string]*Tunnel),
 		byHost:     make(map[string]*Tunnel),
+		byCustom:   make(map[string]*Tunnel),
 		byUser:     make(map[string]int),
 		reserved:   make(map[string]*reservation),
 		domain:     domain,
 		logger:     logger,
 		stopCh:     make(chan struct{}),
+		planLimits: maps.Clone(DefaultPlanLimits),
 		tcpPortMin: tcpPortMin,
 		tcpPortMax: tcpPortMax,
 		tcpUsed:    make(map[int]string),
@@ -492,10 +557,7 @@ func (m *TunnelManager) cleanupStale() {
 					expiresAt: now.Add(5 * time.Minute),
 				}
 			}
-			m.teardownLocked(tunnel)
-			delete(m.tunnels, tunnelID)
-			delete(m.byHost, tunnel.Subdomain)
-			m.byUser[tunnel.Username]--
+			m.removeTunnelLocked(tunnel)
 		}
 	}
 
@@ -526,18 +588,81 @@ func (m *TunnelManager) teardownLocked(tunnel *Tunnel) {
 	tunnel.Conn.Close()
 }
 
+// parseIPNets converts a list of canonical CIDR strings (as produced by
+// protocol.NormalizeIPList) into parsed networks. Entries that fail to parse
+// are skipped: the handshake already rejected invalid input, so this only
+// guards against a server-internal caller bypassing validation.
+func parseIPNets(list []string) []*net.IPNet {
+	if len(list) == 0 {
+		return nil
+	}
+	nets := make([]*net.IPNet, 0, len(list))
+	for _, entry := range list {
+		if _, ipNet, err := net.ParseCIDR(entry); err == nil {
+			nets = append(nets, ipNet)
+		}
+	}
+	return nets
+}
+
+// SetIPFilters normalizes and installs the tunnel's IP allow/deny lists,
+// populating both the display strings and the parsed networks used on the
+// per-request path.
+func (t *Tunnel) SetIPFilters(allowed, denied []string) {
+	allowed, _ = protocol.NormalizeIPList(allowed, "allowed_ips")
+	denied, _ = protocol.NormalizeIPList(denied, "denied_ips")
+	t.AllowedIPs = allowed
+	t.DeniedIPs = denied
+	t.allowedNets = parseIPNets(allowed)
+	t.deniedNets = parseIPNets(denied)
+}
+
 // RegisterOpts holds parameters for tunnel registration.
 type RegisterOpts struct {
-	Conn       *websocket.Conn
-	Username   string
-	Plan       string
-	Subdomain  string // explicit subdomain request
-	SessionID  string // client session ID for reconnect
-	Name       string // named tunnel (e.g. "ui" → username_ui)
-	AllowedIPs []string
-	DeniedIPs  []string
-	BasicAuth  string // "user:pass" for HTTP Basic Auth
-	Binary     bool   // client negotiated binary data frames
+	Conn         *websocket.Conn
+	Username     string
+	Plan         string
+	MaxTunnels   int    // per-user quota override from the users file (0 = plan default)
+	Subdomain    string // explicit subdomain request
+	SessionID    string // client session ID for reconnect
+	Name         string // named tunnel (e.g. "ui" → username_ui)
+	AllowedIPs   []string
+	DeniedIPs    []string
+	BasicAuth    string // "user:pass" for HTTP Basic Auth
+	CustomDomain string // verified custom hostname ("" = none)
+	Binary       bool   // client negotiated binary data frames
+}
+
+// LookupCustom finds a tunnel by its verified custom hostname.
+func (m *TunnelManager) LookupCustom(host string) (*Tunnel, bool) {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	tunnel, ok := m.byCustom[host]
+	return tunnel, ok
+}
+
+// registerLocked installs a registered tunnel in all lookup maps. Must be
+// called with m.mu held.
+func (m *TunnelManager) registerTunnelLocked(t *Tunnel) {
+	m.tunnels[t.ID] = t
+	if t.CustomHost != "" {
+		m.byCustom[t.CustomHost] = t
+	} else {
+		m.byHost[t.Subdomain] = t
+	}
+	m.byUser[t.Username]++
+}
+
+// removeTunnelLocked tears down and unmaps a tunnel from all lookup tables.
+// Must be called with m.mu held.
+func (m *TunnelManager) removeTunnelLocked(t *Tunnel) {
+	m.teardownLocked(t)
+	delete(m.tunnels, t.ID)
+	delete(m.byHost, t.Subdomain)
+	if t.CustomHost != "" {
+		delete(m.byCustom, t.CustomHost)
+	}
 }
 
 // Register adds a new tunnel and assigns a subdomain.
@@ -546,10 +671,7 @@ func (m *TunnelManager) Register(opts RegisterOpts) (*Tunnel, error) {
 	defer m.mu.Unlock()
 
 	// Enforce plan quotas.
-	maxTunnels := PlanLimits[opts.Plan]
-	if maxTunnels == 0 {
-		maxTunnels = 1
-	}
+	maxTunnels := m.planLimit(opts.Plan, opts.MaxTunnels)
 	if m.byUser[opts.Username] >= maxTunnels {
 		return nil, fmt.Errorf("quota exceeded: %d/%d tunnels for plan %q", m.byUser[opts.Username], maxTunnels, opts.Plan)
 	}
@@ -598,6 +720,28 @@ func (m *TunnelManager) Register(opts RegisterOpts) (*Tunnel, error) {
 		return nil, err
 	}
 
+	// Claim the verified custom hostname. A live tunnel holding it is only
+	// displaced by its own user reconnecting on the same session — anything
+	// else would let one tenant steal another's domain.
+	if opts.CustomDomain != "" {
+		host := strings.ToLower(strings.TrimSuffix(opts.CustomDomain, "."))
+		if holder, taken := m.byCustom[host]; taken {
+			sameSession := opts.SessionID != "" &&
+				holder.Username == opts.Username &&
+				holder.SessionID == opts.SessionID
+			if !sameSession {
+				return nil, fmt.Errorf("custom domain %q is already in use", host)
+			}
+			m.logger.Info("evicting stale tunnel for custom-domain reconnect",
+				"old_tunnel_id", holder.ID,
+				"session_id", opts.SessionID,
+				"custom_domain", host,
+			)
+			m.byUser[holder.Username]--
+			m.removeTunnelLocked(holder)
+		}
+	}
+
 	tunnelID, err := generateTunnelID()
 	if err != nil {
 		return nil, err
@@ -611,8 +755,6 @@ func (m *TunnelManager) Register(opts RegisterOpts) (*Tunnel, error) {
 		Plan:         opts.Plan,
 		SessionID:    opts.SessionID,
 		ConnectedAt:  now,
-		AllowedIPs:   opts.AllowedIPs,
-		DeniedIPs:    opts.DeniedIPs,
 		BasicAuth:    opts.BasicAuth,
 		Binary:       opts.Binary,
 		Conn:         opts.Conn,
@@ -620,9 +762,15 @@ func (m *TunnelManager) Register(opts RegisterOpts) (*Tunnel, error) {
 		lastActivity: now,
 	}
 
-	m.tunnels[tunnelID] = tunnel
-	m.byHost[subdomain] = tunnel
-	m.byUser[opts.Username]++
+	tunnel.SetIPFilters(opts.AllowedIPs, opts.DeniedIPs)
+	if m.rateLimitRPS > 0 {
+		tunnel.rateLimiter = newTokenBucket(m.rateLimitRPS, m.rateLimitBurst)
+	}
+	if opts.CustomDomain != "" {
+		tunnel.CustomHost = strings.ToLower(strings.TrimSuffix(opts.CustomDomain, "."))
+	}
+
+	m.registerTunnelLocked(tunnel)
 
 	return tunnel, nil
 }
@@ -652,8 +800,7 @@ func (m *TunnelManager) checkSubdomainClaim(subdomain string, opts RegisterOpts)
 			)
 			existing.doneOnce.Do(func() { close(existing.done) })
 			existing.Conn.Close()
-			delete(m.tunnels, existing.ID)
-			delete(m.byHost, subdomain)
+			m.removeTunnelLocked(existing)
 			m.byUser[existing.Username]--
 			return nil
 		}
@@ -715,9 +862,7 @@ func (m *TunnelManager) Unregister(tunnelID string) {
 		)
 	}
 
-	m.teardownLocked(tunnel)
-	delete(m.tunnels, tunnelID)
-	delete(m.byHost, tunnel.Subdomain)
+	m.removeTunnelLocked(tunnel)
 	m.byUser[tunnel.Username]--
 }
 
@@ -767,15 +912,13 @@ func (m *TunnelManager) DrainAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for tunnelID, tunnel := range m.tunnels {
+	for _, tunnel := range m.tunnels {
 		tunnel.writeMu.Lock()
 		tunnel.Conn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseGoingAway, "server shutting down"))
 		tunnel.writeMu.Unlock()
 
-		m.teardownLocked(tunnel)
-		delete(m.tunnels, tunnelID)
-		delete(m.byHost, tunnel.Subdomain)
+		m.removeTunnelLocked(tunnel)
 	}
 }
 
@@ -786,10 +929,7 @@ func (m *TunnelManager) RegisterTCP(opts RegisterOpts) (*Tunnel, error) {
 	defer m.mu.Unlock()
 
 	// Enforce plan quotas.
-	maxTunnels := PlanLimits[opts.Plan]
-	if maxTunnels == 0 {
-		maxTunnels = 1
-	}
+	maxTunnels := m.planLimit(opts.Plan, opts.MaxTunnels)
 	if m.byUser[opts.Username] >= maxTunnels {
 		return nil, fmt.Errorf("quota exceeded: %d/%d tunnels for plan %q", m.byUser[opts.Username], maxTunnels, opts.Plan)
 	}
@@ -853,8 +993,6 @@ func (m *TunnelManager) RegisterTCP(opts RegisterOpts) (*Tunnel, error) {
 		Protocol:     protocol.ProtocolTCP,
 		TCPPort:      port,
 		ConnectedAt:  now,
-		AllowedIPs:   opts.AllowedIPs,
-		DeniedIPs:    opts.DeniedIPs,
 		BasicAuth:    opts.BasicAuth,
 		Binary:       opts.Binary,
 		Conn:         opts.Conn,
@@ -863,9 +1001,12 @@ func (m *TunnelManager) RegisterTCP(opts RegisterOpts) (*Tunnel, error) {
 		lastActivity: now,
 	}
 
-	m.tunnels[tunnelID] = tunnel
-	m.byHost[subdomain] = tunnel
-	m.byUser[opts.Username]++
+	tunnel.SetIPFilters(opts.AllowedIPs, opts.DeniedIPs)
+	if m.rateLimitRPS > 0 {
+		tunnel.rateLimiter = newTokenBucket(m.rateLimitRPS, m.rateLimitBurst)
+	}
+
+	m.registerTunnelLocked(tunnel)
 
 	return tunnel, nil
 }

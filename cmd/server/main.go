@@ -34,13 +34,15 @@ var (
 	defaultAIO         = "" // set to "true" to enable AIO by default
 
 	// Populated by generated embedded.go init() — encrypted at rest in the binary.
-	embeddedAIO         bool
-	embeddedDomain      string
-	embeddedAIOBind     string
-	embeddedAIOEmail    string
-	embeddedAIOCertPath string
-	embeddedCFToken     string
-	embeddedUsersData   string
+	embeddedAIO            bool
+	embeddedDomain         string
+	embeddedAIOBind        string
+	embeddedAIOEmail       string
+	embeddedAIOCertPath    string
+	embeddedCFToken        string
+	embeddedAIODNSProvider string
+	embeddedAIODNSSecret   string
+	embeddedUsersData      string
 )
 
 func main() {
@@ -52,10 +54,17 @@ func main() {
 	flag.IntVar(&cfg.TCPPortMin, "tcp-port-min", envOrDefaultInt("MABO_TUNNEL_TCP_PORT_MIN", 10000), "Start of TCP port range for TCP tunnels")
 	flag.IntVar(&cfg.TCPPortMax, "tcp-port-max", envOrDefaultInt("MABO_TUNNEL_TCP_PORT_MAX", 10100), "End of TCP port range for TCP tunnels")
 	flag.StringVar(&cfg.LogLevel, "log-level", envOrDefault("MABO_TUNNEL_LOG_LEVEL", "info"), "Log level: debug, info, warn, error")
+	flag.IntVar(&cfg.PlanFreeLimit, "plan-free-tunnels", envOrDefaultInt("MABO_TUNNEL_PLAN_FREE_TUNNELS", 0), "Concurrent tunnels for the free plan (default: 1; per-user override wins)")
+	flag.IntVar(&cfg.PlanProLimit, "plan-pro-tunnels", envOrDefaultInt("MABO_TUNNEL_PLAN_PRO_TUNNELS", 0), "Concurrent tunnels for the pro plan (default: 10; per-user override wins)")
+	flag.IntVar(&cfg.TunnelRateRPS, "tunnel-rps", envOrDefaultInt("MABO_TUNNEL_TUNNEL_RPS", 0), "Per-tunnel request rate cap (requests/second, 0 = unlimited)")
+	flag.IntVar(&cfg.TunnelRateBurst, "tunnel-burst", envOrDefaultInt("MABO_TUNNEL_TUNNEL_BURST", 0), "Instant burst allowed above the per-tunnel rate (default: same as --tunnel-rps)")
 
 	var trustedProxies string
 	flag.StringVar(&trustedProxies, "trusted-proxies", envOrDefault("MABO_TUNNEL_TRUSTED_PROXIES", ""),
 		"Comma-separated CIDRs whose X-Forwarded-For header is trusted (default: loopback and private ranges)")
+	var customDomains string
+	flag.StringVar(&customDomains, "custom-domains", envOrDefault("MABO_TUNNEL_CUSTOM_DOMAINS", ""),
+		"Comma-separated zone suffixes under which users may register verified custom domains\n  (e.g. \"apps.example.com\" allows wilmer.apps.example.com via a TXT challenge)")
 
 	// AIO (all-in-one) mode flags.
 	cfg.AIO = defaultAIO == "true"
@@ -64,6 +73,10 @@ func main() {
 	flag.StringVar(&cfg.AIOEmail, "aio-email", envOrDefault("MABO_TUNNEL_AIO_EMAIL", defaultAIOEmail), "ACME email for Let's Encrypt (AIO mode)")
 	flag.StringVar(&cfg.AIOCFToken, "aio-cf-token", envOrDefault("CF_API_TOKEN", ""), "Cloudflare API token for DNS-01 challenge (AIO mode)")
 	flag.StringVar(&cfg.AIOCertPath, "aio-cert-path", envOrDefault("MABO_TUNNEL_AIO_CERT_PATH", defaultAIOCertPath), "Certificate storage path (AIO mode)")
+	flag.StringVar(&cfg.AIODNSProvider, "aio-dns-provider", envOrDefault("MABO_TUNNEL_AIO_DNS_PROVIDER", "cloudflare"), "DNS-01 challenge provider for AIO mode: cloudflare, digitalocean, route53")
+	var dnsSecret string
+	flag.StringVar(&dnsSecret, "aio-dns-secret", envOrDefault("MABO_TUNNEL_AIO_DNS_SECRET", ""), "Provider's second credential (AWS Secret Access Key for route53; unused otherwise)")
+	flag.StringVar(&cfg.AdminToken, "admin-token", envOrDefault("MABO_TUNNEL_ADMIN_TOKEN", ""), "Enable the admin API (/admin/*, /metrics) guarded by this token. Empty disables both.")
 
 	showVer := flag.Bool("version", false, "Print version and exit")
 	doUpgrade := flag.Bool("upgrade", false, "Self-update this binary from GitHub Releases, then exit")
@@ -94,6 +107,13 @@ func main() {
 	if trustedProxies != "" {
 		cfg.TrustedProxies = strings.Split(trustedProxies, ",")
 	}
+	if customDomains != "" {
+		for _, z := range strings.Split(customDomains, ",") {
+			if z = strings.ToLower(strings.TrimSpace(z)); z != "" {
+				cfg.CustomDomains = append(cfg.CustomDomains, z)
+			}
+		}
+	}
 
 	// Apply encrypted embedded values (from generated embedded.go) as fallbacks.
 	if embeddedAIO {
@@ -115,10 +135,18 @@ func main() {
 		if cfg.AIOCFToken == "" && embeddedCFToken != "" {
 			cfg.AIOCFToken = embeddedCFToken
 		}
+		if embeddedAIODNSProvider != "" && cfg.AIODNSProvider == "cloudflare" && os.Getenv("MABO_TUNNEL_AIO_DNS_PROVIDER") == "" {
+			cfg.AIODNSProvider = embeddedAIODNSProvider
+		}
+		if cfg.AIODNSSecret == "" && embeddedAIODNSSecret != "" {
+			cfg.AIODNSSecret = embeddedAIODNSSecret
+		}
 		if embeddedUsersData != "" {
 			cfg.EmbeddedUsers = embeddedUsersData
 		}
 	}
+
+	cfg.AIODNSSecret = dnsSecret
 
 	// Validate AIO requirements.
 	if cfg.AIO {
@@ -141,13 +169,22 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle graceful shutdown.
+	// Handle graceful shutdown and hot reload.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
-		sig := <-sigCh
-		fmt.Printf("\nReceived %v, shutting down...\n", sig)
-		cancel()
+		for sig := range sigCh {
+			if sig == syscall.SIGHUP {
+				fmt.Println("SIGHUP: reloading users file...")
+				if err := srv.ReloadUsers(); err != nil {
+					fmt.Fprintf(os.Stderr, "reload failed: %v\n", err)
+				}
+				continue
+			}
+			fmt.Printf("\nReceived %v, shutting down...\n", sig)
+			cancel()
+			return
+		}
 	}()
 
 	if err := srv.Run(ctx); err != nil && ctx.Err() == nil {

@@ -15,13 +15,32 @@ const (
 	maxBodyCapture = 64 * 1024
 )
 
+// CapturedFrame is one chunk of a WebSocket passthrough session, captured for
+// the dashboard. Passthrough streams raw bytes, so chunks follow wire framing
+// rather than clean message boundaries.
+type CapturedFrame struct {
+	Direction string    `json:"direction"` // "to_local" or "from_local"
+	Text      string    `json:"text"`
+	Size      int       `json:"size"`   // original chunk size in bytes
+	Binary    bool      `json:"binary"` // true when the chunk was not printable text
+	Timestamp time.Time `json:"timestamp"`
+}
+
+const (
+	// maxWSFramesPerSession caps how many passthrough chunks are stored per
+	// captured WS entry.
+	maxWSFramesPerSession = 50
+	// maxWSFrameCapture caps the preview retained per chunk.
+	maxWSFrameCapture = 512
+)
+
 // CapturedRequest holds a captured HTTP request/response pair.
 type CapturedRequest struct {
 	ID              string              `json:"id"`
 	TunnelID        string              `json:"tunnel_id"`
 	Method          string              `json:"method"`
 	Path            string              `json:"path"`
-	FullURL         string              `json:"full_url"`
+	FullURL         string              `json:"full_url,omitempty"`
 	Host            string              `json:"host,omitempty"`
 	RequestHeaders  map[string][]string `json:"request_headers"`
 	RequestBody     string              `json:"request_body,omitempty"`
@@ -32,6 +51,8 @@ type CapturedRequest struct {
 	DurationMs      float64             `json:"duration_ms"`
 	Timestamp       time.Time           `json:"timestamp"`
 	RemoteAddr      string              `json:"remote_addr"`
+	WSFrames        []CapturedFrame     `json:"ws_frames,omitempty"`
+	WSDropped       int                 `json:"ws_frames_dropped,omitempty"`
 }
 
 // ringBuffer is a fixed-size circular buffer for captured requests.
@@ -141,6 +162,82 @@ func (insp *Inspector) Record(tunnelID string, r *http.Request, reqBody []byte, 
 		insp.buffers[tunnelID] = buf
 	}
 	buf.push(captured)
+}
+
+// RecordWSSession stores a new captured entry for a WebSocket passthrough
+// session and returns it. Callers keep the pointer and feed chunks back via
+// AppendWSFrame.
+func (insp *Inspector) RecordWSSession(tunnelID, path string) *CapturedRequest {
+	id, err := generateRequestID()
+	if err != nil {
+		return nil
+	}
+	req := &CapturedRequest{
+		ID:             id,
+		TunnelID:       tunnelID,
+		Method:         "WS",
+		Path:           path,
+		ResponseStatus: 101,
+		Timestamp:      time.Now(),
+	}
+
+	insp.mu.Lock()
+	defer insp.mu.Unlock()
+	buf, ok := insp.buffers[tunnelID]
+	if !ok {
+		buf = newRingBuffer(maxRequestsPerTunnel)
+		insp.buffers[tunnelID] = buf
+	}
+	buf.push(req)
+	return req
+}
+
+// AppendWSFrame records a passthrough chunk onto its captured session entry.
+// Once maxWSFramesPerSession is reached, further frames are counted in
+// WSDropped instead of stored.
+func (insp *Inspector) AppendWSFrame(req *CapturedRequest, direction string, data []byte) {
+	if insp == nil || req == nil || len(data) == 0 {
+		return
+	}
+
+	binary := false
+	for _, b := range data {
+		if (b < 0x20 && b != '\t' && b != '\n' && b != '\r') || b == 0x7f {
+			binary = true
+			break
+		}
+	}
+	preview := data
+	if len(preview) > maxWSFrameCapture {
+		preview = preview[:maxWSFrameCapture]
+	}
+	text := string(preview)
+	if binary {
+		// Hex keeps the dashboard renderable; a text preview would be mojibake.
+		text = hex.EncodeToString(preview)
+	}
+
+	insp.mu.Lock()
+	defer insp.mu.Unlock()
+	buf, ok := insp.buffers[req.TunnelID]
+	if !ok {
+		return
+	}
+	live := buf.find(req.ID)
+	if live == nil {
+		return
+	}
+	if len(live.WSFrames) >= maxWSFramesPerSession {
+		live.WSDropped++
+		return
+	}
+	live.WSFrames = append(live.WSFrames, CapturedFrame{
+		Direction: direction,
+		Text:      text,
+		Size:      len(data),
+		Binary:    binary,
+		Timestamp: time.Now(),
+	})
 }
 
 // GetRequests returns all captured requests for a tunnel (oldest first).

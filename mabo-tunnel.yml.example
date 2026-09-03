@@ -26,6 +26,19 @@ tunnels:
     # HTTP Basic Auth on this tunnel's public endpoint (optional).
     # auth: "user:pass"
 
+    # Restrict who can reach this tunnel (optional, CIDRs or bare IPs).
+    # The deny list is checked first; an empty allow list means everyone.
+    # allow_ips:
+    #   - 10.0.0.0/8
+    #   - 203.0.113.7
+    # deny_ips:
+    #   - 192.0.2.1
+
+    # Serve under your own hostname instead of a server subdomain (optional;
+    # the server must enable --custom-domains and you must prove ownership by
+    # publishing TXT _mabo-challenge.<domain> = sha256(<token-hash>.<domain>).
+    # custom_domain: api.apps.example.com
+
     # Manipulate headers on proxied requests (optional).
     headers:
       # Added or overridden on the way to your local service.

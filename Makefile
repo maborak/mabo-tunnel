@@ -66,6 +66,8 @@ AIO_EMAIL     ?= $(MABO_TUNNEL_AIO_EMAIL)
 AIO_BIND      ?= $(or $(BIND_IP),0.0.0.0)
 AIO_CERT_PATH ?= data/certs
 AIO_USERS     ?= data/users.txt
+AIO_DNS_PROVIDER ?= cloudflare
+AIO_DNS_SECRET   ?= $(MABO_TUNNEL_AIO_DNS_SECRET)
 
 HOST_GOOS     := $(shell go env GOOS)
 HOST_GOARCH   := $(shell go env GOARCH)
@@ -92,6 +94,7 @@ define aio_build
 	@go run ./cmd/embed-secrets \
 	  --domain=$(AIO_DOMAIN) --aio-email=$(AIO_EMAIL) --aio-bind=$(AIO_BIND) \
 	  --aio-cert-path=$(AIO_CERT_PATH) --aio-cf-token=$(CF_API_TOKEN) \
+	  --aio-dns-provider=$(AIO_DNS_PROVIDER) --aio-dns-secret="$(AIO_DNS_SECRET)" \
 	  --users-file=$(AIO_USERS) --output=cmd/server/embedded.go
 	GOOS=$(1) GOARCH=$(2) go build -ldflags="-w -s $(LDFLAGS)" -o $(3) ./cmd/server
 	@rm -f cmd/server/embedded.go
@@ -127,6 +130,7 @@ build-aio-dev:
 	  --aio-bind=$(AIO_BIND) \
 	  --aio-cert-path=$(AIO_CERT_PATH) \
 	  --aio-cf-token=$(CF_API_TOKEN) \
+	  --aio-dns-provider=$(AIO_DNS_PROVIDER) --aio-dns-secret="$(AIO_DNS_SECRET)" \
 	  --users-file=$(AIO_USERS) \
 	  --output=cmd/server/embedded.go
 	@go build -o $(BINARY_SERVER) ./cmd/server

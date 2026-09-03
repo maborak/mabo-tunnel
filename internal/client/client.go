@@ -70,6 +70,9 @@ type Config struct {
 	BasicAuth     string            // "user:pass" — HTTP Basic Auth on the tunnel
 	HeadersAdd    map[string]string // headers to add/override on proxied requests
 	HeadersRemove []string          // headers to remove from proxied requests
+	AllowedIPs    []string          // CIDRs/IPs allowed to reach the tunnel (empty = everyone)
+	DeniedIPs     []string          // CIDRs/IPs blocked from the tunnel (checked before the allow list)
+	CustomDomain  string            // serve this tunnel under its own verified hostname
 }
 
 // pendingRequest is a proxied request handed from the read loop to a worker:
@@ -277,13 +280,16 @@ func (c *Client) teardownConns() {
 
 func (c *Client) authenticate(conn *websocket.Conn) error {
 	authReq := protocol.AuthRequest{
-		Token:     c.config.Token,
-		Subdomain: c.config.Subdomain,
-		SessionID: c.sessionID,
-		Name:      c.config.Name,
-		Protocol:  c.config.Protocol,
-		BasicAuth: c.config.BasicAuth,
-		Binary:    true,
+		Token:        c.config.Token,
+		Subdomain:    c.config.Subdomain,
+		SessionID:    c.sessionID,
+		Name:         c.config.Name,
+		Protocol:     c.config.Protocol,
+		BasicAuth:    c.config.BasicAuth,
+		AllowedIPs:   c.config.AllowedIPs,
+		DeniedIPs:    c.config.DeniedIPs,
+		CustomDomain: c.config.CustomDomain,
+		Binary:       true,
 	}
 
 	env, err := protocol.NewEnvelope(protocol.TypeAuthRequest, &authReq)
@@ -912,6 +918,13 @@ func (c *Client) handleWebSocketPassthrough(ctx context.Context, connID string, 
 	// a tunnel teardown during the upgrade reaches the socket instead of
 	// leaving an unreachable goroutine behind.
 	lc := newLocalConn()
+	var wsCapture *CapturedRequest
+	if c.inspector != nil {
+		wsCapture = c.inspector.RecordWSSession(c.tunnelID, path)
+		lc.SetOnWrite(func(b []byte) {
+			c.inspector.AppendWSFrame(wsCapture, "to_local", b)
+		})
+	}
 	lc.Attach(localConnRaw)
 	c.localConns.Store(connID, lc)
 	defer func() {
@@ -962,6 +975,7 @@ func (c *Client) handleWebSocketPassthrough(ctx context.Context, connID string, 
 		for {
 			n, readErr := localBuf.Read(buf)
 			if n > 0 {
+				c.inspector.AppendWSFrame(wsCapture, "from_local", buf[:n])
 				if err := c.sendData(connID, buf[:n]); err != nil {
 					return
 				}

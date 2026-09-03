@@ -182,6 +182,21 @@ func (ld *LocalDashboard) handleTunnelRoutes(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	if len(parts) >= 2 && parts[1] == "har" {
+		if len(parts) == 2 && r.Method == http.MethodGet {
+			requests := ld.inspector.GetRequests(tunnelID)
+			if requests == nil {
+				requests = make([]*CapturedRequest, 0)
+			}
+			har := BuildHAR(requests, version.Version)
+			if r.URL.Query().Get("download") != "" {
+				w.Header().Set("Content-Disposition", `attachment; filename="mabo-tunnel-`+tunnelID+`.har"`)
+			}
+			jsonResponse(w, har, http.StatusOK)
+			return
+		}
+	}
+
 	if len(parts) >= 2 && parts[1] == "requests" {
 		if len(parts) == 2 && r.Method == http.MethodGet {
 			requests := ld.inspector.GetRequests(tunnelID)

@@ -1,12 +1,21 @@
 package protocol
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
+	"strings"
 )
 
 // Protocol version.
 const Version = 1
+
+// MaxIPListEntries bounds the allowed_ips / denied_ips lists a client may
+// attach to the auth handshake, so a hostile client cannot make the server
+// parse an unbounded filter list on every connect.
+const MaxIPListEntries = 32
 
 // Message types for the tunnel protocol.
 const (
@@ -175,16 +184,28 @@ type Envelope struct {
 
 // AuthRequest is sent by the client to authenticate.
 type AuthRequest struct {
-	Token      string   `json:"token"`
-	Subdomain  string   `json:"subdomain,omitempty"`
-	SessionID  string   `json:"session_id,omitempty"`  // persistent across reconnects
-	Name       string   `json:"name,omitempty"`        // named tunnel (e.g. "ui" → username_ui subdomain)
-	Graceful   bool     `json:"graceful,omitempty"`    // true on clean shutdown (Ctrl+C) — clears reservation
-	Protocol   string   `json:"protocol,omitempty"`    // "http" (default) or "tcp"
-	AllowedIPs []string `json:"allowed_ips,omitempty"` // IP allow list for incoming requests
-	DeniedIPs  []string `json:"denied_ips,omitempty"`  // IP deny list for incoming requests
-	BasicAuth  string   `json:"basic_auth,omitempty"`  // "user:pass" — HTTP Basic Auth on the tunnel
-	Binary     bool     `json:"binary,omitempty"`      // client understands binary data frames
+	Token        string   `json:"token"`
+	Subdomain    string   `json:"subdomain,omitempty"`
+	SessionID    string   `json:"session_id,omitempty"` // persistent across reconnects
+	Name         string   `json:"name,omitempty"`       // named tunnel (e.g. "ui" → username_ui subdomain)
+	Graceful     bool     `json:"graceful,omitempty"`   // true on clean shutdown (Ctrl+C) — clears reservation
+	Protocol     string   `json:"protocol,omitempty"`   // "http" (default) or "tcp"
+	AllowedIPs   []string `json:"allowed_ips,omitempty"`
+	DeniedIPs    []string `json:"denied_ips,omitempty"`
+	BasicAuth    string   `json:"basic_auth,omitempty"`    // "user:pass" — HTTP Basic Auth on the tunnel
+	CustomDomain string   `json:"custom_domain,omitempty"` // serve this tunnel under its own hostname
+	Binary       bool     `json:"binary,omitempty"`        // client understands binary data frames
+}
+
+// CustomDomainChallenge is the TXT value proving control of a custom domain:
+// sha256("<token-hash-hex>.<domain>"). Both sides derive it without storing or
+// transmitting anything extra — the client knows the raw token, the server
+// knows the stored hash, and a leaked challenge reveals neither.
+const CustomDomainTXTLabel = "_mabo-challenge"
+
+func CustomDomainChallenge(tokenHashHex, domain string) string {
+	sum := sha256.Sum256([]byte(tokenHashHex + "." + strings.ToLower(strings.TrimSuffix(domain, "."))))
+	return hex.EncodeToString(sum[:])
 }
 
 // AuthResponse is sent by the server after authentication.
@@ -290,4 +311,41 @@ func ParseEnvelope(data []byte) (*Envelope, error) {
 		return nil, fmt.Errorf("unmarshal envelope: %w", err)
 	}
 	return &env, nil
+}
+
+// NormalizeIPList validates a list of IPs/CIDRs from the auth handshake and
+// returns canonical CIDR strings: bare IPs become /32 (or /128 for IPv6).
+// Invalid entries or an oversized list return an error, so a bad value is
+// rejected at the handshake instead of silently mis-filtering later.
+func NormalizeIPList(list []string, what string) ([]string, error) {
+	if len(list) == 0 {
+		return nil, nil
+	}
+	if len(list) > MaxIPListEntries {
+		return nil, fmt.Errorf("%s: too many entries (%d, max %d)", what, len(list), MaxIPListEntries)
+	}
+	out := make([]string, 0, len(list))
+	for _, entry := range list {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			if _, _, err := net.ParseCIDR(entry); err != nil {
+				return nil, fmt.Errorf("%s: invalid CIDR %q", what, entry)
+			}
+			out = append(out, entry)
+			continue
+		}
+		ip := net.ParseIP(entry)
+		if ip == nil {
+			return nil, fmt.Errorf("%s: invalid IP %q", what, entry)
+		}
+		if ip.To4() != nil {
+			out = append(out, entry+"/32")
+		} else {
+			out = append(out, entry+"/128")
+		}
+	}
+	return out, nil
 }

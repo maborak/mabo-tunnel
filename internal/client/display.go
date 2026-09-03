@@ -5,20 +5,30 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Port colors for multi-tunnel coloring.
-var portColors = []lipgloss.Color{
-	lipgloss.Color("42"),  // green
-	lipgloss.Color("45"),  // cyan
-	lipgloss.Color("214"), // yellow/orange
-	lipgloss.Color("206"), // magenta/pink
-	lipgloss.Color("75"),  // blue
-	lipgloss.Color("252"), // white
+// Port colors for multi-tunnel coloring — the single source of truth for both
+// the lipgloss header rendering and the raw ANSI codes used in log lines.
+var portColorCodes = []string{
+	"42",  // green
+	"45",  // cyan
+	"214", // yellow/orange
+	"206", // magenta/pink
+	"75",  // blue
+	"252", // white
+}
+
+func portColor(i int) lipgloss.Color {
+	return lipgloss.Color(portColorCodes[i%len(portColorCodes)])
+}
+
+func ansiColor(code string) string {
+	return "\033[38;5;" + code + "m"
 }
 
 // ANSI for inline log coloring (used in log line strings).
@@ -43,6 +53,7 @@ type MsgTunnelReady struct {
 
 // MsgRequest logs a proxied request.
 type MsgRequest struct {
+	Color     string
 	LocalPort int
 	Method    string
 	Path      string
@@ -52,6 +63,7 @@ type MsgRequest struct {
 
 // MsgError logs an error for a tunnel.
 type MsgError struct {
+	Color     string
 	LocalPort int
 	Method    string
 	Path      string
@@ -154,7 +166,7 @@ func (m TUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tunnels[idx].LocalPort = msg.LocalPort
 			m.tunnels[idx].Name = msg.Name
 		} else {
-			color := portColors[len(m.tunnels)%len(portColors)]
+			color := portColor(len(m.tunnels))
 			m.tunnelIndex[key] = len(m.tunnels)
 			m.tunnels = append(m.tunnels, TunnelInfo{
 				URL:       msg.URL,
@@ -306,7 +318,6 @@ func (m TUIModel) headerHeight() int {
 
 func (m TUIModel) formatRequest(msg MsgRequest) string {
 	ts := time.Now().Format("15:04:05")
-	color := m.colorForPort(msg.LocalPort)
 
 	statusColor := ansiGreen
 	if msg.Status >= 400 && msg.Status < 500 {
@@ -317,8 +328,8 @@ func (m TUIModel) formatRequest(msg MsgRequest) string {
 
 	return fmt.Sprintf("%s%s%s %s%-7s%s %s%-4s%s %-35s %s%d%s  %s%s%s",
 		ansiDim, ts, ansiReset,
-		color, fmt.Sprintf(":%d", msg.LocalPort), ansiReset,
-		color, msg.Method, ansiReset,
+		msg.Color, fmt.Sprintf(":%d", msg.LocalPort), ansiReset,
+		msg.Color, msg.Method, ansiReset,
 		truncatePath(msg.Path, 35),
 		statusColor, msg.Status, ansiReset,
 		ansiDim, formatDuration(msg.Duration), ansiReset,
@@ -327,25 +338,15 @@ func (m TUIModel) formatRequest(msg MsgRequest) string {
 
 func (m TUIModel) formatError(msg MsgError) string {
 	ts := time.Now().Format("15:04:05")
-	color := m.colorForPort(msg.LocalPort)
 
 	return fmt.Sprintf("%s%s%s %s%-7s%s %s%-4s%s %-35s %s%sERR%s  %s%s%s",
 		ansiDim, ts, ansiReset,
-		color, fmt.Sprintf(":%d", msg.LocalPort), ansiReset,
-		color, msg.Method, ansiReset,
+		msg.Color, fmt.Sprintf(":%d", msg.LocalPort), ansiReset,
+		msg.Color, msg.Method, ansiReset,
 		truncatePath(msg.Path, 35),
 		ansiRed, ansiBold, ansiReset,
 		ansiRed, truncatePath(msg.Error, 40), ansiReset,
 	)
-}
-
-func (m TUIModel) colorForPort(port int) string {
-	for _, t := range m.tunnels {
-		if t.LocalPort == port {
-			return fmt.Sprintf("\033[38;5;%sm", strings.TrimPrefix(string(t.Color), "#"))
-		}
-	}
-	return ""
 }
 
 // maxLogLines caps the scrollback. Without a cap the slice grows for the life
@@ -362,8 +363,11 @@ func (m *TUIModel) appendLog(line string) {
 		m.logs = m.logs[:maxLogLines]
 	}
 	if m.ready {
+		follow := m.viewport.AtBottom()
 		m.viewport.SetContent(m.renderLogs())
-		m.viewport.GotoBottom()
+		if follow {
+			m.viewport.GotoBottom()
+		}
 	}
 }
 
@@ -397,19 +401,17 @@ func tunnelKey(name, localAddr string, localPort int) string {
 // Display bridges between Client goroutines and the Bubble Tea TUI.
 // Clients call Display methods; Display sends messages to the tea.Program.
 type Display struct {
-	program  *tea.Program
-	mu       sync.Mutex
-	expected int
-	count    int
+	program *tea.Program
+	mu      sync.Mutex
+	count   int
 	// colorsByKey remembers which color was handed out for each tunnel key,
 	// so reconnects keep their original color instead of consuming a new slot.
 	colorsByKey map[string]string
 }
 
 // NewDisplay creates a Display. Call SetProgram after tea.NewProgram.
-func NewDisplay(expectedTunnels int) *Display {
+func NewDisplay() *Display {
 	return &Display{
-		expected:    expectedTunnels,
 		colorsByKey: make(map[string]string),
 	}
 }
@@ -441,15 +443,6 @@ func (d *Display) SetDashboardURL(url string) {
 func (d *Display) AddTunnel(url string, localPort int, name string, localAddr string) string {
 	d.send(MsgTunnelReady{URL: url, LocalAddr: localAddr, LocalPort: localPort, Name: name})
 
-	colors := []string{
-		"\033[38;5;42m",  // green
-		"\033[38;5;45m",  // cyan
-		"\033[38;5;214m", // yellow
-		"\033[38;5;206m", // magenta
-		"\033[38;5;75m",  // blue
-		"\033[38;5;252m", // white
-	}
-
 	key := tunnelKey(name, localAddr, localPort)
 
 	d.mu.Lock()
@@ -457,7 +450,7 @@ func (d *Display) AddTunnel(url string, localPort int, name string, localAddr st
 	if existing, ok := d.colorsByKey[key]; ok {
 		return existing
 	}
-	color := colors[d.count%len(colors)]
+	color := ansiColor(portColorCodes[d.count%len(portColorCodes)])
 	d.count++
 	d.colorsByKey[key] = color
 	return color
@@ -468,11 +461,11 @@ func (d *Display) UpdatePing(ms int64) {
 }
 
 func (d *Display) LogRequest(color string, localPort int, method, path string, status int, duration time.Duration) {
-	d.send(MsgRequest{LocalPort: localPort, Method: method, Path: path, Status: status, Duration: duration})
+	d.send(MsgRequest{Color: color, LocalPort: localPort, Method: method, Path: path, Status: status, Duration: duration})
 }
 
 func (d *Display) LogError(color string, localPort int, method, path, errMsg string) {
-	d.send(MsgError{LocalPort: localPort, Method: method, Path: path, Error: errMsg})
+	d.send(MsgError{Color: color, LocalPort: localPort, Method: method, Path: path, Error: errMsg})
 }
 
 func (d *Display) LogConnectionError(localPort int, msg string) {
@@ -485,7 +478,11 @@ func truncatePath(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen-3] + "..."
+	cut := maxLen - 3
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
 }
 
 func formatDuration(d time.Duration) string {

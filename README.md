@@ -58,15 +58,23 @@ shape of tool for people who already have a VPS and a domain:
 - **All-in-one mode** — built-in TLS with automatic Let's Encrypt wildcard
   certificates. No Caddy or nginx required
 - **HTTP Basic Auth** per tunnel, and header add/remove rules
+- **IP allow/deny lists** per tunnel — `--allow-ip` / `--deny-ip`, matched as
+  real CIDR networks at the edge
+- **Custom domains** — users can point their own hostnames at a tunnel,
+  verified via a TXT challenge, with on-demand certificates in AIO mode
+- **Admin API & metrics** — token-guarded endpoints to list/revoke tunnels and
+  reload users live, plus a Prometheus `/metrics` endpoint
+- **Rate limiting** — optional per-tunnel request-rate cap (`--tunnel-rps`)
+- **Hot user management** — the users file reloads on change or `SIGHUP`; no
+  restart to add or revoke a user
+- **Configurable plans** — quota overrides per user in the users file, plus
+  server-side plan defaults
+- **HAR export** — captured traffic downloads as HAR 1.2 for devtools; WS
+  passthrough sessions are inspected chunk-by-chunk
 - **Hashed tokens** — the user store keeps only `SHA-256(token)`, so it is not a
   credential list
 - **YAML config** for the client
 - **Cross-platform** — Linux (amd64/arm64), macOS (Intel/Apple Silicon), Windows
-
-> [!NOTE]
-> **IP allow/deny lists** are enforced by the server and carried by the protocol
-> (`allowed_ips` / `denied_ips` in the auth handshake), but the bundled client
-> has **no flag or config key to set them yet**.
 
 ## Install
 
@@ -213,8 +221,11 @@ mabo-tunnel-token generate alice pro >> data/users.txt   # token printed once, t
 mabo-tunnel-token migrate data/users.txt                 # convert a legacy plaintext file
 ```
 
-Plans: `free` (1 concurrent tunnel), `pro` (10). The file is read at startup —
-adding or revoking a user currently needs a restart.
+Plans: `free` (1 concurrent tunnel), `pro` (10). Add a fourth field to give one
+user their own quota: `sha256:<hex>:alice:pro:25`. Plan defaults are
+configurable with `--plan-free-tunnels` / `--plan-pro-tunnels`. The file is
+watched and reloaded on change — also on `SIGHUP` or via the admin API — so
+adding or revoking a user needs no restart.
 
 ## Using the client
 
@@ -230,6 +241,12 @@ mabo-tunnel-client --token=$TOKEN --port=ui:192.168.0.40:5173
 
 # Protect the public endpoint
 mabo-tunnel-client --token=$TOKEN --port=3000 --auth=admin:secret
+
+# Only your office network can reach it
+mabo-tunnel-client --token=$TOKEN --port=3000 --allow-ip=203.0.113.0/24
+
+# Your own hostname (needs server --custom-domains plus a TXT ownership record)
+mabo-tunnel-client --token=$TOKEN --port=3000 --custom-domain=demo.apps.example.com
 
 # Ask for a specific subdomain
 mabo-tunnel-client --token=$TOKEN --port=3000 --subdomain=myapp
@@ -296,6 +313,14 @@ per tunnel, and ping latency. Press `q` or `Ctrl+C` to quit.
 | `--aio-email` | `MABO_TUNNEL_AIO_EMAIL` | — | ACME email for Let's Encrypt |
 | `--aio-cf-token` | `CF_API_TOKEN` | — | Cloudflare API token (DNS-01) |
 | `--aio-cert-path` | `MABO_TUNNEL_AIO_CERT_PATH` | `data/certs` | Certificate storage directory |
+| `--aio-dns-provider` | `MABO_TUNNEL_AIO_DNS_PROVIDER` | `cloudflare` | DNS-01 provider: `cloudflare`, `digitalocean`, `route53` |
+| `--aio-dns-secret` | `MABO_TUNNEL_AIO_DNS_SECRET` | — | Second credential for the provider (AWS Secret Access Key) |
+| `--admin-token` | `MABO_TUNNEL_ADMIN_TOKEN` | — | Enable `/admin/*` + `/metrics`, guarded by this bearer token |
+| `--custom-domains` | `MABO_TUNNEL_CUSTOM_DOMAINS` | — | Zone suffixes users may register verified hostnames under |
+| `--plan-free-tunnels` | `MABO_TUNNEL_PLAN_FREE_TUNNELS` | `1` | Free-plan concurrent tunnels (per-user override wins) |
+| `--plan-pro-tunnels` | `MABO_TUNNEL_PLAN_PRO_TUNNELS` | `10` | Pro-plan concurrent tunnels (per-user override wins) |
+| `--tunnel-rps` | `MABO_TUNNEL_TUNNEL_RPS` | off | Per-tunnel request-rate cap (req/s) |
+| `--tunnel-burst` | `MABO_TUNNEL_TUNNEL_BURST` | =rps | Instant burst above the per-tunnel rate |
 
 ### Client
 
@@ -310,6 +335,9 @@ per tunnel, and ping latency. Press `q` or `Ctrl+C` to quit.
 | `--config` | — | `mabo-tunnel.yml` | Path to YAML config file |
 | `--header-add` | — | — | Add a header to proxied requests (repeatable) |
 | `--header-remove` | — | — | Remove a header from proxied requests (repeatable) |
+| `--allow-ip` | `MABO_TUNNEL_ALLOW_IPS` | — | CIDR/IP allowed to reach the tunnel (repeatable, comma-separated) |
+| `--deny-ip` | `MABO_TUNNEL_DENY_IPS` | — | CIDR/IP blocked from the tunnel (checked before the allow list) |
+| `--custom-domain` | `MABO_TUNNEL_CUSTOM_DOMAIN` | — | Serve the tunnel under a verified hostname (single port only) |
 
 ## Limits and timeouts
 
@@ -322,7 +350,9 @@ per tunnel, and ping latency. Press `q` or `Ctrl+C` to quit.
 | In-flight requests per tunnel | 200 | excess gets `503`, logged |
 | Idle tunnel eviction | 5 min | subdomain reserved 5 min for reconnect |
 | Auth rate limit | 5 failed attempts / min / IP | per source IP |
-| Plan quotas | `free` 1 tunnel, `pro` 10 | `internal/server/tunnel.go` |
+| Plan quotas | `free` 1, `pro` 10 (configurable; per-user override via users file) | `internal/server/tunnel.go` |
+| Per-tunnel rate limit | off by default (`--tunnel-rps`) | `internal/server/ratelimit.go` |
+| Custom domain | TXT `_mabo-challenge.<domain>` = sha256("<token-hash>.<domain>") | `--custom-domains` |
 | TCP tunnel port range | 10000–10100 | configurable |
 | Dashboard capture | 100 requests/tunnel, 64 KiB body cap | in-memory ring buffer |
 

@@ -33,6 +33,19 @@ type localConn struct {
 
 	mu   sync.Mutex
 	conn net.Conn
+
+	// onWrite, when set, observes every chunk written to the local socket —
+	// used by WebSocket passthrough to feed the dashboard's frame inspector.
+	onWrite func([]byte)
+}
+
+// SetOnWrite installs an observer invoked with each chunk before it goes to
+// the local socket. It must be called before Attach; the callback runs on the
+// writer goroutine and should be fast.
+func (lc *localConn) SetOnWrite(fn func([]byte)) {
+	lc.mu.Lock()
+	lc.onWrite = fn
+	lc.mu.Unlock()
 }
 
 func newLocalConn() *localConn {
@@ -59,10 +72,17 @@ func (lc *localConn) Conn() net.Conn {
 
 func (lc *localConn) run() {
 	conn := lc.Conn()
+	lc.mu.Lock()
+	hook := lc.onWrite
+	lc.mu.Unlock()
+
 	defer conn.Close()
 	for {
 		select {
 		case b := <-lc.ch:
+			if hook != nil {
+				hook(b)
+			}
 			conn.SetWriteDeadline(time.Now().Add(localWriteTimeout))
 			_, err := conn.Write(b)
 			conn.SetWriteDeadline(time.Time{})

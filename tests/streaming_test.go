@@ -51,7 +51,7 @@ func TestStreamingSSEThroughTunnel(t *testing.T) {
 		LocalPort: backendPort,
 		Subdomain: "sse",
 	}
-	display := client.NewDisplay(1)
+	display := client.NewDisplay()
 	cl := client.New(cfg, display, nil, nil)
 
 	readyCh := make(chan string, 1)

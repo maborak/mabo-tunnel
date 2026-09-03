@@ -17,9 +17,18 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/maborak/mabo-tunnel/internal/client"
 	"github.com/maborak/mabo-tunnel/internal/config"
+	"github.com/maborak/mabo-tunnel/internal/protocol"
 	"github.com/maborak/mabo-tunnel/internal/upgrade"
 	"github.com/maborak/mabo-tunnel/internal/version"
 )
+
+// envOrDefault resolves an environment variable with a fallback.
+func envOrDefaultLocal(env, def string) string {
+	if v := os.Getenv(env); v != "" {
+		return v
+	}
+	return def
+}
 
 type portEntry struct {
 	name          string
@@ -28,6 +37,9 @@ type portEntry struct {
 	auth          string // per-tunnel basic auth override from YAML
 	headersAdd    map[string]string
 	headersRemove []string
+	allowIPs      []string
+	denyIPs       []string
+	customDomain  string
 }
 
 // defaultServerURL is where the client dials when neither --server nor
@@ -49,11 +61,19 @@ func main() {
 
 	tunnelProtocol := flag.String("protocol", envOrDefault("MABO_TUNNEL_PROTOCOL", "http"), "Tunnel protocol: \"http\" (default) or \"tcp\"")
 	basicAuth := flag.String("auth", os.Getenv("MABO_TUNNEL_AUTH"), "HTTP Basic Auth for the tunnel (format: \"user:pass\")")
+	customDomain := flag.String("custom-domain", envOrDefaultLocal("MABO_TUNNEL_CUSTOM_DOMAIN", ""), "Serve this tunnel under its own hostname (requires server --custom-domains and a TXT ownership record; single port only)")
 
 	var headerAddFlags multiFlag
 	var headerRemoveFlags multiFlag
 	flag.Var(&headerAddFlags, "header-add", "Add/override a header on proxied requests (e.g. \"X-Foo: bar\"). Can be repeated.")
 	flag.Var(&headerRemoveFlags, "header-remove", "Remove a header from proxied requests (e.g. \"Cookie\"). Can be repeated.")
+
+	var allowIPFlags ipListFlag
+	var denyIPFlags ipListFlag
+	seedFromEnv(&allowIPFlags, "MABO_TUNNEL_ALLOW_IPS")
+	seedFromEnv(&denyIPFlags, "MABO_TUNNEL_DENY_IPS")
+	flag.Var(&allowIPFlags, "allow-ip", "CIDR or IP allowed to reach the tunnel (repeatable, comma-separated).\n  Deny list is checked first. Empty allow list = everyone. Example: --allow-ip=10.0.0.0/8,203.0.113.7")
+	flag.Var(&denyIPFlags, "deny-ip", "CIDR or IP blocked from reaching the tunnel (repeatable, comma-separated).\n  Checked before the allow list. Example: --deny-ip=192.0.2.1")
 	showVer := flag.Bool("version", false, "Print version and exit")
 	doUpgrade := flag.Bool("upgrade", false, "Self-update this binary from GitHub Releases, then exit")
 	forceUpgrade := flag.Bool("force-upgrade", false, "With --upgrade: reinstall even if already up to date")
@@ -119,6 +139,8 @@ func main() {
 	// Parse CLI header flags into maps (apply to all CLI-defined tunnels).
 	cliHeadersAdd := parseHeaderAddFlags(headerAddFlags)
 	cliHeadersRemove := []string(headerRemoveFlags)
+	cliAllowIPs := []string(allowIPFlags)
+	cliDenyIPs := []string(denyIPFlags)
 
 	// Build tunnel entries: CLI --port takes precedence; fall back to config tunnels.
 	var entries []portEntry
@@ -128,14 +150,19 @@ func main() {
 		for i := range entries {
 			entries[i].headersAdd = cliHeadersAdd
 			entries[i].headersRemove = cliHeadersRemove
+			entries[i].allowIPs = cliAllowIPs
+			entries[i].denyIPs = cliDenyIPs
 		}
 	} else if fileCfg != nil && len(fileCfg.Tunnels) > 0 {
 		for name, t := range fileCfg.Tunnels {
 			e := portEntry{
-				name: name,
-				host: t.Host,
-				port: t.Port,
-				auth: t.Auth,
+				name:         name,
+				host:         t.Host,
+				port:         t.Port,
+				auth:         t.Auth,
+				customDomain: t.CustomDomain,
+				allowIPs:     t.AllowIPs,
+				denyIPs:      t.DenyIPs,
 			}
 			// Start with YAML-defined headers.
 			if len(t.Headers.Add) > 0 {
@@ -158,6 +185,8 @@ func main() {
 			for _, h := range cliHeadersRemove {
 				e.headersRemove = append(e.headersRemove, h)
 			}
+			e.allowIPs = appendIPEntries(e.allowIPs, cliAllowIPs)
+			e.denyIPs = appendIPEntries(e.denyIPs, cliDenyIPs)
 			entries = append(entries, e)
 		}
 	}
@@ -169,13 +198,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	if len(entries) > 1 && *subdomain != "" {
-		fmt.Fprintln(os.Stderr, "Error: --subdomain cannot be used with multiple ports (use named ports instead)")
-		os.Exit(1)
+	if len(entries) > 1 {
+		if *subdomain != "" {
+			fmt.Fprintln(os.Stderr, "Error: --subdomain cannot be used with multiple ports (use named ports instead)")
+			os.Exit(1)
+		}
+		if *customDomain != "" {
+			fmt.Fprintln(os.Stderr, "Error: --custom-domain cannot be used with multiple ports (set custom_domain per tunnel in the config file instead)")
+			os.Exit(1)
+		}
+	}
+
+	// Global --custom-domain applies to every CLI-defined tunnel and overrides
+	// per-tunnel YAML values.
+	if *customDomain != "" {
+		for i := range entries {
+			entries[i].customDomain = *customDomain
+		}
 	}
 
 	// Create shared display and inspector.
-	display := client.NewDisplay(len(entries))
+	display := client.NewDisplay()
 	inspector := client.NewInspector()
 
 	// Start local dashboard on a random available port, bound to loopback only.
@@ -193,16 +236,34 @@ func main() {
 	// to stderr which corrupt the Bubble Tea alt screen.
 	log.SetOutput(io.Discard)
 
-	// Create Bubble Tea program with alt screen.
+	// Create Bubble Tea program with alt screen and mouse support (wheel scroll).
 	p := tea.NewProgram(
 		client.NewTUIModel(),
 		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
 	)
 	display.SetProgram(p)
 
 	// Show dashboard URL in the TUI (must be in goroutine — program isn't running yet).
 	if dashURL := dashboard.URL(); dashURL != "" {
 		go display.SetDashboardURL(dashURL)
+	}
+
+	// Validate IP filter lists up front so a typo fails at the CLI instead of
+	// as an auth rejection loop on every reconnect.
+	for i := range entries {
+		normalized, err := protocol.NormalizeIPList(entries[i].allowIPs, "--allow-ip")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		entries[i].allowIPs = normalized
+		normalized, err = protocol.NormalizeIPList(entries[i].denyIPs, "--deny-ip")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		entries[i].denyIPs = normalized
 	}
 
 	// Context for tunnel clients — canceled when TUI quits or SIGINT.
@@ -236,6 +297,9 @@ func main() {
 			Subdomain:     *subdomain,
 			HeadersAdd:    e.headersAdd,
 			HeadersRemove: e.headersRemove,
+			AllowedIPs:    e.allowIPs,
+			DeniedIPs:     e.denyIPs,
+			CustomDomain:  e.customDomain,
 		}
 
 		wg.Add(1)
@@ -265,6 +329,47 @@ func (f *multiFlag) String() string { return strings.Join(*f, ", ") }
 func (f *multiFlag) Set(value string) error {
 	*f = append(*f, value)
 	return nil
+}
+
+// ipListFlag is a multiFlag that also splits values on commas, so both
+// --allow-ip=10.0.0.0/8 --allow-ip=203.0.113.7 and
+// --allow-ip=10.0.0.0/8,203.0.113.7 work.
+type ipListFlag []string
+
+func (f *ipListFlag) String() string { return strings.Join(*f, ", ") }
+func (f *ipListFlag) Set(value string) error {
+	for _, v := range strings.Split(value, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			*f = append(*f, v)
+		}
+	}
+	return nil
+}
+
+// seedFromEnv pre-populates an ipListFlag from a comma-separated env var so it
+// acts as the flag's default value.
+func seedFromEnv(f *ipListFlag, env string) {
+	if v := os.Getenv(env); v != "" {
+		_ = f.Set(v)
+	}
+}
+
+// appendIPEntries appends entries to a list, skipping duplicates, so CLI flags
+// extend a YAML list instead of duplicating entries already present.
+func appendIPEntries(dst, add []string) []string {
+	for _, v := range add {
+		found := false
+		for _, d := range dst {
+			if d == v {
+				found = true
+				break
+			}
+		}
+		if !found {
+			dst = append(dst, v)
+		}
+	}
+	return dst
 }
 
 // parseHeaderAddFlags converts --header-add "Key: Value" flags into a map.

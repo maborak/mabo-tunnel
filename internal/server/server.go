@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -11,6 +13,9 @@ import (
 
 	"github.com/caddyserver/certmagic"
 	"github.com/libdns/cloudflare"
+	"github.com/libdns/digitalocean"
+	"github.com/libdns/libdns"
+	"github.com/libdns/route53"
 	"github.com/maborak/mabo-tunnel/internal/auth"
 	"github.com/maborak/mabo-tunnel/internal/protocol"
 	"github.com/maborak/mabo-tunnel/internal/version"
@@ -57,6 +62,17 @@ type Config struct {
 	RateLimitMax    int
 	RateLimitWindow time.Duration
 
+	// Per-plan concurrent-tunnel quotas. Zero uses the built-in defaults
+	// (free=1, pro=10); individual users may override theirs with the optional
+	// max-tunnels field in the users file.
+	PlanFreeLimit int
+	PlanProLimit  int
+
+	// Per-tunnel public request-rate cap. TunnelRateRPS <= 0 (the default)
+	// disables edge rate limiting.
+	TunnelRateRPS   int
+	TunnelRateBurst int
+
 	// UpstreamHeaderTimeout bounds how long a proxied request waits for the
 	// local server's response headers. Once headers arrive there is no further
 	// deadline, so a stream may run for as long as it needs. Zero means 60s.
@@ -69,21 +85,45 @@ type Config struct {
 	AIOCFToken  string // Cloudflare API token for DNS-01 challenge
 	AIOCertPath string // certificate storage directory
 
+	// AIODNSProvider selects the DNS-01 challenge provider: "cloudflare"
+	// (default), "digitalocean", or "route53". AIODNSExtra carries the
+	// provider-specific second credential — the AWS Secret Access Key for
+	// route53 (AIODNSecret holds the Access Key ID), unused otherwise.
+	AIODNSProvider string
+	AIODNSSecret   string
+
 	// EmbeddedUsers holds users data decrypted at startup (same format as users.txt).
 	// If non-empty, takes precedence over UsersFile.
 	EmbeddedUsers string
+
+	// AdminToken enables the admin API (/admin/*, /metrics) when non-empty.
+	// Requests must present it as "Authorization: Bearer <token>" or
+	// "X-Admin-Token: <token>". Empty disables both endpoints entirely.
+	AdminToken string
+
+	// CustomDomains lists the zone suffixes under which clients may register
+	// their own verified hostnames (e.g. "apps.example.com" lets a user claim
+	// wilmer.apps.example.com after proving control via a TXT record). Empty
+	// disables custom domains.
+	CustomDomains []string
 }
 
 // Server is the main Mabo Tunnel server.
 type Server struct {
-	config   Config
-	tunnels  *TunnelManager
-	users    *auth.UserStore
-	limiter  *auth.RateLimiter
-	proxy    *ProxyHandler
-	logger   *slog.Logger
-	mux      *http.ServeMux
-	upgrader websocket.Upgrader
+	config    Config
+	tunnels   *TunnelManager
+	users     *auth.UserStore
+	limiter   *auth.RateLimiter
+	proxy     *ProxyHandler
+	logger    *slog.Logger
+	mux       *http.ServeMux
+	upgrader  websocket.Upgrader
+	metrics   *Metrics
+	startedAt time.Time
+
+	// dnsReader is the ACME DNS provider's record reader, set in AIO mode and
+	// used to verify custom-domain ownership via TXT lookup. Nil in plain mode.
+	dnsReader libdns.RecordGetter
 
 	// Resolved keepalive timings.
 	pingInterval time.Duration
@@ -101,6 +141,17 @@ func parseLogLevel(s string) slog.Level {
 		return slog.LevelError
 	default:
 		return slog.LevelInfo
+	}
+}
+
+// logPlaintextWarning flags a users store that still holds unhashed tokens:
+// the file (and any binary embedding it) is then a credential list.
+func logPlaintextWarning(logger *slog.Logger, users *auth.UserStore) {
+	if n := users.PlaintextEntries(); n > 0 {
+		logger.Warn("user file contains unhashed tokens — anyone who reads it can authenticate as those users",
+			"plaintext_entries", n,
+			"migrate_with", "mabo-tunnel-token migrate <users-file>",
+		)
 	}
 }
 
@@ -133,12 +184,7 @@ func New(cfg Config) (*Server, error) {
 
 	// A plaintext entry means the user file (and any binary embedding it) still
 	// holds a usable credential. Hashed entries do not.
-	if n := users.PlaintextEntries(); n > 0 {
-		logger.Warn("user file contains unhashed tokens — anyone who reads it can authenticate as those users",
-			"plaintext_entries", n,
-			"migrate_with", "mabo-tunnel-token migrate <users-file>",
-		)
-	}
+	logPlaintextWarning(logger, users)
 
 	rateMax := cfg.RateLimitMax
 	if rateMax == 0 {
@@ -159,7 +205,23 @@ func New(cfg Config) (*Server, error) {
 		tcpMax = 10100
 	}
 	tunnels := NewTunnelManager(cfg.Domain, tcpMin, tcpMax, logger)
+	if cfg.PlanFreeLimit > 0 || cfg.PlanProLimit > 0 {
+		tunnels.SetPlanLimits(cfg.PlanFreeLimit, cfg.PlanProLimit)
+	}
+	if cfg.TunnelRateRPS > 0 {
+		tunnels.SetRateLimit(cfg.TunnelRateRPS, cfg.TunnelRateBurst)
+	}
+	metrics := NewMetrics()
+	metrics.Gauge("mabo_tunnels_active", "Currently registered tunnels.")
+	metrics.Gauge("mabo_users_loaded", "Users currently loaded from the users file.")
+	metrics.Counter("mabo_tunnels_registered_total", "Tunnels registered since start.", "")
+	metrics.Counter("mabo_tunnels_revoked_total", "Tunnels revoked via the admin API.", "")
+	metrics.Counter("mabo_auth_attempts_total", "Tunnel auth handshakes attempted.", "")
+	metrics.Counter("mabo_auth_failures_total", "Tunnel auth handshakes rejected.", "")
+	metrics.Counter("mabo_http_requests_total", "Public HTTP requests entering the proxy.", "")
+	metrics.Counter("mabo_http_responses_total", "Proxied responses by status class.", "status")
 	proxy := NewProxyHandler(tunnels, cfg.Domain, cfg.TrustedProxies, cfg.UpstreamHeaderTimeout, logger)
+	proxy.SetMetrics(metrics)
 
 	pingEvery := cfg.KeepaliveInterval
 	if pingEvery == 0 {
@@ -177,6 +239,8 @@ func New(cfg Config) (*Server, error) {
 		limiter:      limiter,
 		proxy:        proxy,
 		logger:       logger,
+		metrics:      metrics,
+		startedAt:    time.Now(),
 		pingInterval: pingEvery,
 		pongWait:     pongDeadline,
 		mux:          http.NewServeMux(),
@@ -193,6 +257,11 @@ func New(cfg Config) (*Server, error) {
 	s.mux.HandleFunc("/tunnel/connect", s.handleTunnelConnect)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/ready", s.handleReady)
+	s.mux.HandleFunc("GET /admin/tunnels", s.handleAdminTunnels)
+	s.mux.HandleFunc("DELETE /admin/tunnels/{id}", s.handleAdminTunnelRevoke)
+	s.mux.HandleFunc("POST /admin/users/reload", s.handleAdminUsersReload)
+	s.mux.HandleFunc("GET /admin/stats", s.handleAdminStats)
+	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("/", s.handleRoot)
 
 	// Dashboard and API are served locally on the CLIENT side (localhost:4040).
@@ -228,10 +297,78 @@ func (s *Server) newHTTPServer(addr string) *http.Server {
 
 // Run starts the server and blocks until the context is canceled.
 func (s *Server) Run(ctx context.Context) error {
+	go s.watchUsers(ctx)
 	if s.config.AIO {
 		return s.runAIO(ctx)
 	}
 	return s.runPlain(ctx)
+}
+
+// ReloadUsers re-reads the users file and swaps the in-memory store. A parse
+// failure keeps the previously loaded users: a half-edited file must not lock
+// every token out. Embedded (AIO) stores are immutable by design.
+func (s *Server) ReloadUsers() error {
+	if s.config.EmbeddedUsers != "" {
+		return fmt.Errorf("users are embedded in this binary; rebuild to change them")
+	}
+	if err := s.users.Reload(); err != nil {
+		s.logger.Error("users reload failed; keeping previous users",
+			"error", err,
+			"file", s.config.UsersFile,
+		)
+		return err
+	}
+	s.logger.Info("users reloaded", "count", s.users.Count(), "file", s.config.UsersFile)
+	logPlaintextWarning(s.logger, s.users)
+	return nil
+}
+
+// usersWatchInterval is how often the users file's mtime/size is checked.
+// Polling stays cheap and dependency-free; sub-second pickup is not a goal.
+const usersWatchInterval = 5 * time.Second
+
+// watchUsers reloads the users file when it changes on disk, so adding or
+// revoking a user no longer requires a restart. Only file-backed stores are
+// watched.
+func (s *Server) watchUsers(ctx context.Context) {
+	if s.config.EmbeddedUsers != "" {
+		return
+	}
+	type fileStamp struct {
+		modTime time.Time
+		size    int64
+	}
+	stamp := func() fileStamp {
+		st, err := os.Stat(s.config.UsersFile)
+		if err != nil {
+			return fileStamp{}
+		}
+		return fileStamp{modTime: st.ModTime(), size: st.Size()}
+	}
+	last := stamp()
+
+	ticker := time.NewTicker(usersWatchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cur := stamp()
+			if cur == last {
+				continue
+			}
+			last = cur
+			// A swap-in progress can briefly produce an empty file; a reload
+			// that parses zero users is more likely an editor artifact than
+			// an intent, so skip it and pick up the real content next tick.
+			if cur.size == 0 {
+				s.logger.Warn("users file is empty; waiting for content", "file", s.config.UsersFile)
+				continue
+			}
+			_ = s.ReloadUsers()
+		}
+	}
 }
 
 // shutdown tears down shared background workers.
@@ -270,23 +407,78 @@ func (s *Server) runPlain(ctx context.Context) error {
 	}
 }
 
+// buildDNSProvider constructs the libdns provider for the configured ACME
+// DNS-01 challenge provider. It also returns it as a RecordGetter when the
+// implementation supports reading (all of ours do), which the custom-domain
+// verification path uses.
+func buildDNSProvider(cfg Config) (certmagic.DNSProvider, libdns.RecordGetter, error) {
+	provider := strings.ToLower(strings.TrimSpace(cfg.AIODNSProvider))
+	if provider == "" {
+		provider = "cloudflare"
+	}
+	switch provider {
+	case "cloudflare":
+		if cfg.AIOCFToken == "" {
+			return nil, nil, fmt.Errorf("cloudflare provider requires --aio-cf-token")
+		}
+		p := &cloudflare.Provider{APIToken: cfg.AIOCFToken}
+		return p, p, nil
+	case "digitalocean":
+		if cfg.AIOCFToken == "" {
+			return nil, nil, fmt.Errorf("digitalocean provider requires --aio-cf-token (set to a DigitalOcean API token)")
+		}
+		p := &digitalocean.Provider{APIToken: cfg.AIOCFToken}
+		return p, p, nil
+	case "route53":
+		if cfg.AIOCFToken == "" || cfg.AIODNSSecret == "" {
+			return nil, nil, fmt.Errorf("route53 provider requires --aio-cf-token set to the AWS Access Key ID and --aio-dns-secret set to the Secret Access Key")
+		}
+		p := &route53.Provider{
+			AccessKeyId:     cfg.AIOCFToken,
+			SecretAccessKey: cfg.AIODNSSecret,
+		}
+		return p, p, nil
+	default:
+		return nil, nil, fmt.Errorf("unknown DNS provider %q (supported: cloudflare, digitalocean, route53)", cfg.AIODNSProvider)
+	}
+}
+
 // runAIO starts the all-in-one server: HTTP on :80, HTTPS on :443 with auto Let's Encrypt certs.
 func (s *Server) runAIO(ctx context.Context) error {
 	// Configure CertMagic storage.
 	certmagic.Default.Storage = &certmagic.FileStorage{Path: s.config.AIOCertPath}
 
-	// Configure ACME issuer with DNS-01 challenge via Cloudflare.
+	// Configure ACME issuer with DNS-01 challenge via the selected provider.
+	dnsProvider, dnsReader, err := buildDNSProvider(s.config)
+	if err != nil {
+		return err
+	}
+	s.dnsReader = dnsReader
 	certmagic.DefaultACME.Email = s.config.AIOEmail
 	certmagic.DefaultACME.Agreed = true
 	certmagic.DefaultACME.DNS01Solver = &certmagic.DNS01Solver{
 		DNSManager: certmagic.DNSManager{
-			DNSProvider: &cloudflare.Provider{
-				APIToken: s.config.AIOCFToken,
-			},
+			DNSProvider: dnsProvider,
 		},
 	}
 
 	// Manage certificates for the domain and wildcard.
+	//
+	// On-demand issuance serves verified custom domains: any SNI that is not
+	// the base domain or an active custom hostname is refused, so a hostile
+	// client cannot make the server mint arbitrary certificates.
+	certmagic.Default.OnDemand = &certmagic.OnDemandConfig{
+		DecisionFunc: func(_ context.Context, name string) error {
+			name = strings.ToLower(strings.TrimSuffix(name, "."))
+			if name == s.config.Domain {
+				return nil
+			}
+			if _, ok := s.tunnels.LookupCustom(name); ok {
+				return nil
+			}
+			return fmt.Errorf("certificate issuance denied for %q: not an active custom domain", name)
+		},
+	}
 	magic := certmagic.NewDefault()
 	domains := []string{s.config.Domain, "*." + s.config.Domain}
 	s.logger.Info("provisioning TLS certificates", "domains", domains)
@@ -331,11 +523,109 @@ func (s *Server) runAIO(ctx context.Context) error {
 	}
 }
 
-// ServeHTTP routes requests: subdomain requests go to the proxy, everything else to the mux.
+// customDomainVerifyTimeout bounds one TXT-ownership check at connect time.
+const customDomainVerifyTimeout = 15 * time.Second
+
+// verifyCustomDomain proves that the requesting user controls a hostname by
+// requiring a TXT record at _mabo-challenge.<domain> whose value is
+// sha256("<sha256-of-token-hex>.<domain>") — a value only someone holding the
+// real token can compute, checked against nothing but the stored hash. DNS is
+// read through the ACME provider API in AIO mode (fresh data, no resolver
+// cache) and via public resolvers otherwise.
+func (s *Server) verifyCustomDomain(ctx context.Context, tokenHashHex, domain string) error {
+	if len(s.config.CustomDomains) == 0 {
+		return fmt.Errorf("custom domains are not enabled on this server")
+	}
+	domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+	if len(domain) > 253 || !isHostname(domain) {
+		return fmt.Errorf("custom domain %q is not a valid hostname", domain)
+	}
+	if domain == s.config.Domain || strings.HasSuffix(domain, "."+s.config.Domain) {
+		return fmt.Errorf("custom domain must be outside the base domain %q", s.config.Domain)
+	}
+
+	zone := ""
+	for _, z := range s.config.CustomDomains {
+		z = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(z), "."))
+		if domain == z || strings.HasSuffix(domain, "."+z) {
+			zone = z
+			break
+		}
+	}
+	if zone == "" {
+		return fmt.Errorf("custom domain must end with one of the enabled zones (%s)", strings.Join(s.config.CustomDomains, ", "))
+	}
+
+	expected := protocol.CustomDomainChallenge(tokenHashHex, domain)
+	fqdn := protocol.CustomDomainTXTLabel + "." + domain
+
+	vctx, cancel := context.WithTimeout(ctx, customDomainVerifyTimeout)
+	defer cancel()
+
+	match := func(value string) bool {
+		return strings.EqualFold(strings.TrimSpace(value), expected)
+	}
+
+	if s.dnsReader != nil {
+		records, err := s.dnsReader.GetRecords(vctx, zone)
+		if err != nil {
+			return fmt.Errorf("reading zone %q: %w", zone, err)
+		}
+		for _, rec := range records {
+			txt, ok := rec.(libdns.TXT)
+			if !ok {
+				continue
+			}
+			name := strings.ToLower(strings.TrimSuffix(txt.Name, "."))
+			if name != "" && !strings.HasSuffix(name, "."+zone) && name != zone {
+				name += "." + zone
+			}
+			if strings.EqualFold(name, fqdn) && match(txt.Text) {
+				return nil
+			}
+		}
+	} else {
+		values, err := net.LookupTXT(fqdn)
+		if err == nil {
+			for _, v := range values {
+				if match(v) {
+					return nil
+				}
+			}
+		}
+	}
+	return fmt.Errorf("ownership not proven: no TXT record %q with the challenge value (see docs for --custom-domain)", fqdn)
+}
+
+// isHostname checks basic DNS-name syntax: dot-separated labels of letters,
+// digits and hyphens.
+func isHostname(s string) bool {
+	for _, label := range strings.Split(s, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ServeHTTP routes requests: subdomain and verified custom-domain hosts go to
+// the proxy, everything else to the mux.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := hostWithoutPort(r.Host)
 
 	if strings.HasSuffix(host, "."+s.config.Domain) {
+		s.proxy.ServeHTTP(w, r)
+		return
+	}
+	if _, ok := s.tunnels.LookupCustom(host); ok {
 		s.proxy.ServeHTTP(w, r)
 		return
 	}
@@ -357,7 +647,7 @@ func (s *Server) handleTunnelConnect(w http.ResponseWriter, r *http.Request) {
 	remoteAddr := s.proxy.extractClientIP(r)
 
 	// Authenticate the client.
-	ar := handleAuth(conn, s.users, s.limiter, remoteAddr, s.logger)
+	ar := handleAuth(conn, s.users, s.limiter, remoteAddr, s.logger, s.metrics)
 	if ar == nil {
 		conn.Close()
 		return
@@ -378,18 +668,43 @@ func (s *Server) handleTunnelConnect(w http.ResponseWriter, r *http.Request) {
 		tunnelProtocol = protocol.ProtocolHTTP
 	}
 
-	opts := RegisterOpts{
-		Conn:       conn,
-		Username:   ar.User.Username,
-		Plan:       ar.User.Plan,
-		Subdomain:  subdomain,
-		SessionID:  ar.SessionID,
-		Name:       ar.Name,
-		AllowedIPs: ar.AllowedIPs,
-		DeniedIPs:  ar.DeniedIPs,
-		BasicAuth:  ar.BasicAuth,
-		Binary:     ar.Binary,
+	// Custom domains are verified here, before any registry state changes.
+	customHost := ""
+	if ar.CustomDomain != "" {
+		if tunnelProtocol != protocol.ProtocolHTTP {
+			sendAuthResponse(conn, false, "custom domains are only supported for HTTP tunnels", nil)
+			conn.Close()
+			return
+		}
+		tokenHashHex := hex.EncodeToString(ar.TokenKey[:])
+		if err := s.verifyCustomDomain(r.Context(), tokenHashHex, ar.CustomDomain); err != nil {
+			s.logger.Warn("custom domain rejected",
+				"username", ar.User.Username,
+				"domain", ar.CustomDomain,
+				"error", err,
+			)
+			sendAuthResponse(conn, false, err.Error(), nil)
+			conn.Close()
+			return
+		}
+		customHost = strings.ToLower(strings.TrimSuffix(ar.CustomDomain, "."))
 	}
+
+	opts := RegisterOpts{
+		Conn:         conn,
+		Username:     ar.User.Username,
+		Plan:         ar.User.Plan,
+		MaxTunnels:   ar.User.MaxTunnels,
+		Subdomain:    subdomain,
+		SessionID:    ar.SessionID,
+		Name:         ar.Name,
+		AllowedIPs:   ar.AllowedIPs,
+		DeniedIPs:    ar.DeniedIPs,
+		BasicAuth:    ar.BasicAuth,
+		CustomDomain: customHost,
+		Binary:       ar.Binary,
+	}
+	s.metrics.Inc("mabo_tunnels_registered_total", "")
 
 	var tunnel *Tunnel
 	switch tunnelProtocol {
@@ -449,7 +764,7 @@ func (s *Server) handleTunnelConnect(w http.ResponseWriter, r *http.Request) {
 		}
 
 		tunnel.Protocol = protocol.ProtocolHTTP
-		tunnelURL := s.tunnels.URL(tunnel.Subdomain, s.effectiveScheme())
+		tunnelURL := s.tunnelURL(tunnel)
 		s.logger.Info("tunnel registered",
 			"tunnel_id", tunnel.ID,
 			"subdomain", tunnel.Subdomain,

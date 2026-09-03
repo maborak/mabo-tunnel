@@ -117,7 +117,7 @@ func startTunnelClient(t *testing.T, localPort int) (tunnelURL string, cancel co
 		LocalPort: localPort,
 	}
 
-	c := client.New(cfg, client.NewDisplay(1), nil, nil)
+	c := client.New(cfg, client.NewDisplay(), nil, nil)
 
 	readyCh := make(chan string, 1)
 	c.OnReady = func(url string) {

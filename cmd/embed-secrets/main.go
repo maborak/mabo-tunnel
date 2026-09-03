@@ -16,6 +16,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/maborak/mabo-tunnel/internal/auth"
 	"github.com/maborak/mabo-tunnel/internal/secrets"
 )
 
@@ -24,7 +25,9 @@ func main() {
 	aioBind := flag.String("aio-bind", envOr("MABO_TUNNEL_AIO_BIND", "0.0.0.0"), "Bind IP")
 	aioEmail := flag.String("aio-email", envOr("MABO_TUNNEL_AIO_EMAIL", ""), "ACME email")
 	aioCertPath := flag.String("aio-cert-path", envOr("MABO_TUNNEL_AIO_CERT_PATH", "data/certs"), "Cert path")
-	aioCFToken := flag.String("aio-cf-token", envOr("CF_API_TOKEN", ""), "Cloudflare API token")
+	aioCFToken := flag.String("aio-cf-token", envOr("CF_API_TOKEN", ""), "DNS provider API credential (Cloudflare token / DigitalOcean token / AWS Access Key ID)")
+	dnsProvider := flag.String("aio-dns-provider", envOr("MABO_TUNNEL_AIO_DNS_PROVIDER", "cloudflare"), "DNS-01 challenge provider: cloudflare, digitalocean, route53")
+	dnsSecret := flag.String("aio-dns-secret", envOr("MABO_TUNNEL_AIO_DNS_SECRET", ""), "Provider's second credential (AWS Secret Access Key for route53; unused otherwise)")
 	usersFile := flag.String("users-file", envOr("MABO_TUNNEL_USERS_FILE", "data/users.txt"), "Path to users.txt")
 	output := flag.String("output", "cmd/server/embedded.go", "Output Go source file")
 	_ = flag.Bool("hardened", false, "Deprecated: runtime checks were removed; flag is accepted and ignored")
@@ -45,6 +48,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate and normalize at build time: only canonical hashed entries
+	// (sha256:<hex>:username:plan) are embedded — no comments, no plaintext
+	// tokens. A malformed users file fails the build here instead of the
+	// server at startup.
+	normalized, err := auth.NormalizeUsersData(string(usersData))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+		fmt.Fprintf(os.Stderr, "       fix %s and rebuild.\n", *usersFile)
+		os.Exit(1)
+	}
+	usersData = []byte(normalized)
+
 	// Generate random key.
 	baseKey := make([]byte, 32)
 	if _, err := rand.Read(baseKey); err != nil {
@@ -55,6 +70,16 @@ func main() {
 	encCFToken, err := secrets.Encrypt(baseKey, []byte(*aioCFToken))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error encrypting CF token: %v\n", err)
+		os.Exit(1)
+	}
+	encDNSProvider, err := secrets.Encrypt(baseKey, []byte(*dnsProvider))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error encrypting DNS provider: %v\n", err)
+		os.Exit(1)
+	}
+	encDNSSecret, err := secrets.Encrypt(baseKey, []byte(*dnsSecret))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error encrypting DNS secret: %v\n", err)
 		os.Exit(1)
 	}
 	encUsersData, err := secrets.Encrypt(baseKey, usersData)
@@ -89,6 +114,8 @@ func main() {
 
 	b.WriteString("\t// Decrypt secrets.\n")
 	b.WriteString(fmt.Sprintf("\tif v, err := secrets.Decrypt(key, %s); err == nil { embeddedCFToken = string(v) }\n", goBytes(encCFToken)))
+	b.WriteString(fmt.Sprintf("\tif v, err := secrets.Decrypt(key, %s); err == nil { embeddedAIODNSProvider = string(v) }\n", goBytes(encDNSProvider)))
+	b.WriteString(fmt.Sprintf("\tif v, err := secrets.Decrypt(key, %s); err == nil { embeddedAIODNSSecret = string(v) }\n", goBytes(encDNSSecret)))
 	b.WriteString(fmt.Sprintf("\tif v, err := secrets.Decrypt(key, %s); err == nil { embeddedUsersData = string(v) }\n", goBytes(encUsersData)))
 	b.WriteString("}\n")
 
@@ -97,7 +124,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stderr, "Generated %s (encrypted, %d users bytes)\n", *output, len(usersData))
+	fmt.Fprintf(os.Stderr, "Generated %s (encrypted, %d hashed users)\n", *output, strings.Count(normalized, "\n"))
 }
 
 func goBytes(b []byte) string {

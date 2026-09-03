@@ -16,6 +16,9 @@ your local app(s), and runs a terminal UI plus a local inspection dashboard.
 | `--config` | — | `mabo-tunnel.yml` | Path to a YAML config file |
 | `--header-add` | — | — | Add/override a header on proxied requests (`"X-Foo: bar"`), repeatable |
 | `--header-remove` | — | — | Remove a header from proxied requests (`"Cookie"`), repeatable |
+| `--allow-ip` | `MABO_TUNNEL_ALLOW_IPS` | — | CIDR/IP allowed to reach the tunnel, repeatable or comma-separated (empty = everyone) |
+| `--deny-ip` | `MABO_TUNNEL_DENY_IPS` | — | CIDR/IP blocked from the tunnel, checked before the allow list |
+| `--custom-domain` | `MABO_TUNNEL_CUSTOM_DOMAIN` | — | Serve under a verified hostname (single port only) |
 | `--version` | — | — | Print version and exit |
 | `--upgrade` | — | — | Self-update this binary from GitHub Releases, then exit |
 | `--force-upgrade` | — | — | With `--upgrade`: reinstall even if already up to date |
@@ -141,11 +144,18 @@ it to inspect traffic. Endpoints (JSON, `Access-Control-Allow-Origin: *`):
 | `GET /_api/tunnels/{id}/requests` | Request summaries (newest ring buffer) |
 | `GET /_api/tunnels/{id}/requests/{rid}` | Full captured request/response |
 | `POST /_api/tunnels/{id}/requests/{rid}/replay` | Replay a captured request through the tunnel |
+| `GET /_api/tunnels/{id}/har` | Export captured traffic as HAR 1.2 (`?download=1` to save) |
 | `GET /_api/status` | Uptime + active tunnel count |
 
 The UI supports filtering by method / status class / path search, viewing
 request and response bodies with JSON pretty-printing, replaying requests, and
 copying as cURL / fetch / wget.
+
+WebSocket passthrough sessions are captured too: each appears as a `WS` entry
+with up to **50 chunks of 512 B** (direction-tagged `to_local` / `from_local`,
+binary chunks hex-encoded), surfaced in the request detail JSON and as
+`_webSocketMessages` in the HAR export. Passthrough streams raw bytes, so
+chunks follow wire framing rather than clean message boundaries.
 
 Capture limits: **100 requests per tunnel** (ring buffer) and **64 KiB per
 body**, all in memory — nothing is persisted to disk.

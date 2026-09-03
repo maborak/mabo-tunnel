@@ -83,7 +83,7 @@ func TestStoredFormDoesNotContainTheToken(t *testing.T) {
 
 	// Nothing reachable from the store should reveal the token.
 	user, _ := store.Authenticate(token)
-	if fmt.Sprintf("%+v", *user) != "{Username:alice Plan:pro}" {
+	if fmt.Sprintf("%+v", *user) != "{Username:alice Plan:pro MaxTunnels:0}" {
 		t.Errorf("User carries unexpected fields: %+v", *user)
 	}
 }
@@ -215,5 +215,78 @@ func TestRateLimiterCapsTrackedAddresses(t *testing.T) {
 
 	if got := rl.TrackedIPs(); got > 10 {
 		t.Errorf("TrackedIPs() = %d, want at most 10", got)
+	}
+}
+
+func TestParseIgnoresPipesInComments(t *testing.T) {
+	data := "# Add users with: mabo-tunnel-token generate <username> [free|pro] >> data/users.txt\n" +
+		"# Plans: free (1 tunnel), pro (10)\n" +
+		HashToken("tok") + ":alice:pro\n"
+	store, err := NewUserStoreFromData(data)
+	if err != nil {
+		t.Fatalf("a '|' inside a comment must not split the line: %v", err)
+	}
+	if _, ok := store.Authenticate("tok"); !ok {
+		t.Error("entry following the piped comment should authenticate")
+	}
+}
+
+func TestPipeSeparatorsStillWorkInData(t *testing.T) {
+	data := HashToken("a") + ":alice:pro|" + HashToken("b") + ":bob:free|"
+	store, err := NewUserStoreFromData(data)
+	if err != nil {
+		t.Fatalf("NewUserStoreFromData: %v", err)
+	}
+	for _, tok := range []string{"a", "b"} {
+		if _, ok := store.Authenticate(tok); !ok {
+			t.Errorf("token %q should authenticate", tok)
+		}
+	}
+}
+
+func TestParseMaxTunnelsOverride(t *testing.T) {
+	store, err := NewUserStoreFromData("alice-token:alice:pro:25\nbob-token:bob:free\n")
+	if err != nil {
+		t.Fatalf("NewUserStoreFromData: %v", err)
+	}
+	alice, ok := store.Authenticate("alice-token")
+	if !ok || alice.Username != "alice" {
+		t.Fatalf("alice should authenticate, got %+v", alice)
+	}
+	if alice.MaxTunnels != 25 {
+		t.Errorf("alice MaxTunnels = %d, want 25", alice.MaxTunnels)
+	}
+	bob, ok := store.Authenticate("bob-token")
+	if !ok {
+		t.Fatal("bob should authenticate")
+	}
+	if bob.MaxTunnels != 0 {
+		t.Errorf("bob MaxTunnels = %d, want 0 (plan default)", bob.MaxTunnels)
+	}
+}
+
+func TestNormalizePreservesMaxTunnels(t *testing.T) {
+	normalized, err := NormalizeUsersData("plain-token:alice:pro:25\n")
+	if err != nil {
+		t.Fatalf("NormalizeUsersData: %v", err)
+	}
+	store, err := NewUserStoreFromData(normalized)
+	if err != nil {
+		t.Fatalf("normalized data should parse: %v (data: %q)", err, normalized)
+	}
+	user, ok := store.Authenticate("plain-token")
+	if !ok || user.MaxTunnels != 25 {
+		t.Errorf("quota lost through normalization: %+v", user)
+	}
+	if store.PlaintextEntries() != 0 {
+		t.Error("normalized data must not contain plaintext tokens")
+	}
+}
+
+func TestParseRejectsBadQuota(t *testing.T) {
+	for _, in := range []string{"tok:alice:pro:0\n", "tok:alice:pro:x\n", "tok:alice:pro:-3\n"} {
+		if _, err := NewUserStoreFromData(in); err == nil {
+			t.Errorf("expected an error for %q", in)
+		}
 	}
 }

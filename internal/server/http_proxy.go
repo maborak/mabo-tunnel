@@ -44,6 +44,13 @@ type ProxyHandler struct {
 	logger            *slog.Logger
 	trustedProxies    []*net.IPNet
 	firstEventTimeout time.Duration
+	metrics           *Metrics
+}
+
+// SetMetrics attaches an optional metrics sink; nil (the default) disables
+// metric collection on this handler.
+func (p *ProxyHandler) SetMetrics(m *Metrics) {
+	p.metrics = m
 }
 
 // NewProxyHandler creates a new ProxyHandler. trustedProxies is a list of
@@ -85,10 +92,17 @@ func isWebSocketUpgrade(r *http.Request) bool {
 
 // ServeHTTP routes incoming requests to the appropriate tunnel.
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.metrics.Inc("mabo_http_requests_total", "")
 	subdomain := p.extractSubdomain(r.Host)
 	if subdomain == "" {
-		http.Error(w, "No tunnel specified. Use <subdomain>."+p.domain, http.StatusBadRequest)
-		return
+		// Not a <subdomain>.<base-domain> request — try a registered custom
+		// hostname before giving up.
+		tunnel, customOk := p.tunnels.LookupCustom(hostWithoutPort(r.Host))
+		if !customOk {
+			http.Error(w, "No tunnel specified. Use <subdomain>."+p.domain, http.StatusBadRequest)
+			return
+		}
+		subdomain = tunnel.Subdomain
 	}
 
 	tunnel, ok := p.tunnels.LookupByHost(subdomain)
@@ -110,6 +124,16 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+	}
+
+	// Per-tunnel request-rate cap. The bucket belongs to the tunnel, so the
+	// limit travels with the tunnel across reconnects and is shared by every
+	// concurrent public caller hammering it.
+	if tunnel.rateLimiter != nil && !tunnel.rateLimiter.allow() {
+		p.metrics.Inc("mabo_http_responses_total", statusClass(429))
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
 	}
 
 	// Bound how many requests one tunnel may have in flight, so a single
@@ -329,6 +353,7 @@ func (p *ProxyHandler) streamResponse(w http.ResponseWriter, r *http.Request, tu
 				w.Header().Set("X-Mabo Tunnel-Tunnel", tunnel.ID)
 				w.WriteHeader(ev.Header.StatusCode)
 				headersWritten = true
+				p.metrics.Inc("mabo_http_responses_total", statusClass(ev.Header.StatusCode))
 				if flusher != nil {
 					flusher.Flush()
 				}
@@ -641,64 +666,49 @@ func (p *ProxyHandler) extractSubdomain(host string) string {
 	return subdomain
 }
 
-// checkIPAccess validates the requester's IP against the tunnel's deny and allow lists.
-// Deny list is checked first. If the allow list is non-empty, only listed IPs are permitted.
+// checkIPAccess validates the requester's IP against the tunnel's deny and
+// allow lists. Deny list is checked first. If the allow list is non-empty,
+// only listed networks are permitted. Both lists hold CIDRs; a bare IP was
+// normalized to /32 or /128 at the handshake.
 func (p *ProxyHandler) checkIPAccess(r *http.Request, tunnel *Tunnel) bool {
-	if len(tunnel.DeniedIPs) == 0 && len(tunnel.AllowedIPs) == 0 {
+	if len(tunnel.deniedNets) == 0 && len(tunnel.allowedNets) == 0 {
 		return true
 	}
 
-	clientIP := normalizeIP(p.extractClientIP(r))
-	if clientIP == "" {
+	clientIP := net.ParseIP(p.extractClientIP(r))
+	if clientIP == nil {
 		// We could not establish an origin. With an allow list configured the
 		// safe answer is no.
-		return len(tunnel.AllowedIPs) == 0
+		return len(tunnel.allowedNets) == 0
 	}
 
 	// Check deny list first.
-	for _, denied := range tunnel.DeniedIPs {
-		if clientIP == normalizeIP(denied) {
+	for _, denied := range tunnel.deniedNets {
+		if denied.Contains(clientIP) {
 			p.logger.Warn("IP denied by deny list",
-				"ip", clientIP,
+				"ip", clientIP.String(),
+				"cidr", denied.String(),
 				"tunnel_id", tunnel.ID,
 			)
 			return false
 		}
 	}
 
-	// If allow list is non-empty, only listed IPs are permitted.
-	if len(tunnel.AllowedIPs) > 0 {
-		for _, allowed := range tunnel.AllowedIPs {
-			if clientIP == normalizeIP(allowed) {
+	// If allow list is non-empty, only listed networks are permitted.
+	if len(tunnel.allowedNets) > 0 {
+		for _, allowed := range tunnel.allowedNets {
+			if allowed.Contains(clientIP) {
 				return true
 			}
 		}
 		p.logger.Warn("IP not in allow list",
-			"ip", clientIP,
+			"ip", clientIP.String(),
 			"tunnel_id", tunnel.ID,
 		)
 		return false
 	}
 
 	return true
-}
-
-// normalizeIP canonicalizes an IP string for list comparison. The same
-// address has several textual forms ("6.6.6.6" vs "::ffff:6.6.6.6"), and a
-// deny entry that only matches one of them is a deny entry a caller walks
-// through by re-encoding its address. Unparsable input is returned unchanged,
-// which fails closed for allow lists and open for deny entries that could
-// never have matched anyway.
-func normalizeIP(s string) string {
-	s = strings.TrimSpace(s)
-	ip := net.ParseIP(s)
-	if ip == nil {
-		return s
-	}
-	if v4 := ip.To4(); v4 != nil {
-		return v4.String()
-	}
-	return ip.String()
 }
 
 // setForwardedFor appends the verified requester origin to the request's
