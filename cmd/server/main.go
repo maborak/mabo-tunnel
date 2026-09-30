@@ -26,12 +26,14 @@ import (
 //
 // Either way, a flag or environment variable still wins at runtime.
 var (
-	defaultDomain      = "localhost"
-	defaultUsersFile   = "data/users.txt"
-	defaultAIOBind     = "0.0.0.0"
-	defaultAIOEmail    = ""
-	defaultAIOCertPath = "data/certs"
-	defaultAIO         = "" // set to "true" to enable AIO by default
+	defaultDomain       = "localhost"
+	defaultUsersFile    = "data/users.txt"
+	defaultAIOBind      = "0.0.0.0"
+	defaultAIOEmail     = ""
+	defaultAIOCertPath  = "data/certs"
+	defaultAIOHTTPPort  = 80
+	defaultAIOHTTPSPort = 443
+	defaultAIO          = "" // set to "true" to enable AIO by default
 
 	// Populated by generated embedded.go init() — encrypted at rest in the binary.
 	embeddedAIO            bool
@@ -70,6 +72,8 @@ func main() {
 	cfg.AIO = defaultAIO == "true"
 	flag.BoolVar(&cfg.AIO, "aio", cfg.AIO, "All-in-one mode: HTTP:80 + HTTPS:443 + auto Let's Encrypt certs")
 	flag.StringVar(&cfg.AIOBind, "aio-bind", envOrDefault("MABO_TUNNEL_AIO_BIND", defaultAIOBind), "Bind IP for AIO mode")
+	flag.IntVar(&cfg.AIOHTTPPort, "aio-http-port", envOrDefaultInt("MABO_TUNNEL_AIO_HTTP_PORT", defaultAIOHTTPPort), "HTTP port for AIO mode (default: 80)")
+	flag.IntVar(&cfg.AIOHTTPSPort, "aio-https-port", envOrDefaultInt("MABO_TUNNEL_AIO_HTTPS_PORT", defaultAIOHTTPSPort), "HTTPS port for AIO mode (default: 443)")
 	flag.StringVar(&cfg.AIOEmail, "aio-email", envOrDefault("MABO_TUNNEL_AIO_EMAIL", defaultAIOEmail), "ACME email for Let's Encrypt (AIO mode)")
 	flag.StringVar(&cfg.AIOCFToken, "aio-cf-token", envOrDefault("CF_API_TOKEN", ""), "Cloudflare API token for DNS-01 challenge (AIO mode)")
 	flag.StringVar(&cfg.AIOCertPath, "aio-cert-path", envOrDefault("MABO_TUNNEL_AIO_CERT_PATH", defaultAIOCertPath), "Certificate storage path (AIO mode)")

@@ -79,11 +79,13 @@ type Config struct {
 	UpstreamHeaderTimeout time.Duration
 
 	// AIO (all-in-one) mode: built-in HTTP + HTTPS + auto certs.
-	AIO         bool
-	AIOBind     string // bind IP (default: 0.0.0.0)
-	AIOEmail    string // ACME email for Let's Encrypt
-	AIOCFToken  string // Cloudflare API token for DNS-01 challenge
-	AIOCertPath string // certificate storage directory
+	AIO          bool
+	AIOBind      string // bind IP (default: 0.0.0.0)
+	AIOHTTPPort  int    // HTTP port for AIO mode (default: 80)
+	AIOHTTPSPort int    // HTTPS port for AIO mode (default: 443)
+	AIOEmail     string // ACME email for Let's Encrypt
+	AIOCFToken   string // Cloudflare API token for DNS-01 challenge
+	AIOCertPath  string // certificate storage directory
 
 	// AIODNSProvider selects the DNS-01 challenge provider: "cloudflare"
 	// (default), "digitalocean", or "route53". AIODNSExtra carries the
@@ -443,7 +445,8 @@ func buildDNSProvider(cfg Config) (certmagic.DNSProvider, libdns.RecordGetter, e
 	}
 }
 
-// runAIO starts the all-in-one server: HTTP on :80, HTTPS on :443 with auto Let's Encrypt certs.
+// runAIO starts the all-in-one server: HTTP + HTTPS (ports configurable via
+// AIOHTTPPort/AIOHTTPSPort, defaults 80/443) with auto Let's Encrypt certs.
 func (s *Server) runAIO(ctx context.Context) error {
 	// Configure CertMagic storage.
 	certmagic.Default.Storage = &certmagic.FileStorage{Path: s.config.AIOCertPath}
@@ -476,12 +479,30 @@ func (s *Server) runAIO(ctx context.Context) error {
 			if _, ok := s.tunnels.LookupCustom(name); ok {
 				return nil
 			}
-			return fmt.Errorf("certificate issuance denied for %q: not an active custom domain", name)
+			// Active tunnel subdomains (<sub>.<Domain>) are also legitimate
+			// names; this is a fallback for when the wildcard cert is not yet
+			// cached (e.g. issuance failed on a previous start).
+			if strings.HasSuffix(name, "."+s.config.Domain) {
+				if _, ok := s.tunnels.LookupByHost(strings.TrimSuffix(name, "."+s.config.Domain)); ok {
+					return nil
+				}
+			}
+			return fmt.Errorf("certificate issuance denied for %q: not an active tunnel or custom domain", name)
 		},
 	}
 	magic := certmagic.NewDefault()
 	domains := []string{s.config.Domain, "*." + s.config.Domain}
 	s.logger.Info("provisioning TLS certificates", "domains", domains)
+	// Obtain the base + wildcard certs NOW, synchronously. With OnDemand
+	// configured, ManageSync defers all issuance to first handshake, and the
+	// DecisionFunc above would then deny wildcard subdomains -> tunnels could
+	// never get TLS. ObtainCertSync bypasses the on-demand path; ManageSync
+	// afterwards just registers the certs for renewal.
+	for _, d := range domains {
+		if err := magic.ObtainCertSync(ctx, d); err != nil {
+			return fmt.Errorf("certmagic: obtain %s: %w", d, err)
+		}
+	}
 	if err := magic.ManageSync(ctx, domains); err != nil {
 		return fmt.Errorf("certmagic: %w", err)
 	}
@@ -492,8 +513,17 @@ func (s *Server) runAIO(ctx context.Context) error {
 	tlsConfig.NextProtos = []string{"h2", "http/1.1"}
 
 	bind := s.config.AIOBind
-	httpAddr := bind + ":80"
-	httpsAddr := bind + ":443"
+	httpPort := s.config.AIOHTTPPort
+	if httpPort == 0 {
+		httpPort = 80
+	}
+	httpsPort := s.config.AIOHTTPSPort
+	if httpsPort == 0 {
+		httpsPort = 443
+	}
+
+	httpAddr := fmt.Sprintf("%s:%d", bind, httpPort)
+	httpsAddr := fmt.Sprintf("%s:%d", bind, httpsPort)
 
 	httpServer := s.newHTTPServer(httpAddr)
 	httpsServer := s.newHTTPServer(httpsAddr)
