@@ -663,7 +663,7 @@ func (p *ProxyHandler) extractSubdomain(host string) string {
 		return ""
 	}
 
-	return subdomain
+	return registeredSubdomain(subdomain)
 }
 
 // checkIPAccess validates the requester's IP against the tunnel's deny and

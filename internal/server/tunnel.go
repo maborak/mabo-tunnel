@@ -904,7 +904,11 @@ func (m *TunnelManager) URL(subdomain, scheme string) string {
 	if scheme == "" {
 		scheme = "http"
 	}
-	return fmt.Sprintf("%s://%s.%s", scheme, subdomain, m.domain)
+	return fmt.Sprintf("%s://%s-tunnel.%s", scheme, subdomain, m.domain)
+}
+
+func registeredSubdomain(label string) string {
+	return strings.TrimSuffix(label, "-tunnel")
 }
 
 // DrainAll closes all tunnels gracefully.

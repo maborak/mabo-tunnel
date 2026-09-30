@@ -39,11 +39,12 @@ const (
 
 // Config holds server configuration.
 type Config struct {
-	Addr       string
-	Domain     string
-	UsersFile  string
-	TCPPortMin int // start of TCP port range for TCP tunnels (inclusive)
-	TCPPortMax int // end of TCP port range for TCP tunnels (inclusive)
+	Addr          string
+	Domain        string
+	ControlDomain string
+	UsersFile     string
+	TCPPortMin    int // start of TCP port range for TCP tunnels (inclusive)
+	TCPPortMax    int // end of TCP port range for TCP tunnels (inclusive)
 
 	// TrustedProxies lists CIDRs whose X-Forwarded-For header is believed.
 	// Empty means loopback plus the private ranges.
@@ -473,7 +474,7 @@ func (s *Server) runAIO(ctx context.Context) error {
 	certmagic.Default.OnDemand = &certmagic.OnDemandConfig{
 		DecisionFunc: func(_ context.Context, name string) error {
 			name = strings.ToLower(strings.TrimSuffix(name, "."))
-			if name == s.config.Domain {
+			if name == s.config.Domain || name == s.config.ControlDomain {
 				return nil
 			}
 			if _, ok := s.tunnels.LookupCustom(name); ok {
@@ -483,7 +484,8 @@ func (s *Server) runAIO(ctx context.Context) error {
 			// names; this is a fallback for when the wildcard cert is not yet
 			// cached (e.g. issuance failed on a previous start).
 			if strings.HasSuffix(name, "."+s.config.Domain) {
-				if _, ok := s.tunnels.LookupByHost(strings.TrimSuffix(name, "."+s.config.Domain)); ok {
+				label := strings.TrimSuffix(name, "."+s.config.Domain)
+				if _, ok := s.tunnels.LookupByHost(registeredSubdomain(label)); ok {
 					return nil
 				}
 			}
@@ -650,6 +652,11 @@ func isHostname(s string) bool {
 // the proxy, everything else to the mux.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := hostWithoutPort(r.Host)
+
+	if host == s.config.ControlDomain {
+		s.mux.ServeHTTP(w, r)
+		return
+	}
 
 	if strings.HasSuffix(host, "."+s.config.Domain) {
 		s.proxy.ServeHTTP(w, r)

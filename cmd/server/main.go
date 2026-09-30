@@ -52,6 +52,7 @@ func main() {
 
 	flag.StringVar(&cfg.Addr, "addr", envOrDefault("MABO_TUNNEL_ADDR", ":8080"), "HTTP listen address")
 	flag.StringVar(&cfg.Domain, "domain", envOrDefault("MABO_TUNNEL_DOMAIN", defaultDomain), "Base domain for tunnels")
+	flag.StringVar(&cfg.ControlDomain, "control-domain", envOrDefault("MABO_TUNNEL_CONTROL_DOMAIN", ""), "Hostname used for client control connections")
 	flag.StringVar(&cfg.UsersFile, "users-file", envOrDefault("MABO_TUNNEL_USERS_FILE", defaultUsersFile), "Path to users file")
 	flag.IntVar(&cfg.TCPPortMin, "tcp-port-min", envOrDefaultInt("MABO_TUNNEL_TCP_PORT_MIN", 10000), "Start of TCP port range for TCP tunnels")
 	flag.IntVar(&cfg.TCPPortMax, "tcp-port-max", envOrDefaultInt("MABO_TUNNEL_TCP_PORT_MAX", 10100), "End of TCP port range for TCP tunnels")
@@ -86,6 +87,9 @@ func main() {
 	doUpgrade := flag.Bool("upgrade", false, "Self-update this binary from GitHub Releases, then exit")
 	forceUpgrade := flag.Bool("force-upgrade", false, "With --upgrade: reinstall even if already up to date")
 	flag.Parse()
+	if cfg.ControlDomain == "" {
+		cfg.ControlDomain = cfg.Domain
+	}
 
 	// Informational modes short-circuit before config resolution and AIO
 	// validation — --upgrade needs no domain, users file or ACME email.
