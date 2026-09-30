@@ -73,6 +73,7 @@ type Config struct {
 	AllowedIPs    []string          // CIDRs/IPs allowed to reach the tunnel (empty = everyone)
 	DeniedIPs     []string          // CIDRs/IPs blocked from the tunnel (checked before the allow list)
 	CustomDomain  string            // serve this tunnel under its own verified hostname
+	PreserveHost  bool              // forward the public Host header to the local service
 }
 
 // pendingRequest is a proxied request handed from the read loop to a worker:
@@ -780,6 +781,10 @@ func (c *Client) handleRequest(ctx context.Context, pr *pendingRequest) {
 	// it, so the local app reading the rightmost entry gets an address the
 	// edge actually confirmed. Overwriting it here would erase that (and an
 	// http.ReadRequest request has no RemoteAddr to write instead).
+	if c.config.PreserveHost {
+		// Preserve the public tunnel hostname for virtual-hosted local services.
+		proxyReq.Host = req.Host
+	}
 	proxyReq.Header.Set("X-Forwarded-Host", req.Host)
 	proxyReq.Header.Set("X-Forwarded-Proto", "https")
 

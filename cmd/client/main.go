@@ -62,6 +62,7 @@ func main() {
 	tunnelProtocol := flag.String("protocol", envOrDefault("MABO_TUNNEL_PROTOCOL", "http"), "Tunnel protocol: \"http\" (default) or \"tcp\"")
 	basicAuth := flag.String("auth", os.Getenv("MABO_TUNNEL_AUTH"), "HTTP Basic Auth for the tunnel (format: \"user:pass\")")
 	customDomain := flag.String("custom-domain", envOrDefaultLocal("MABO_TUNNEL_CUSTOM_DOMAIN", ""), "Serve this tunnel under its own hostname (requires server --custom-domains and a TXT ownership record; single port only)")
+	preserveHost := flag.Bool("preserve-host", false, "Forward the public tunnel Host header to the local service")
 
 	var headerAddFlags multiFlag
 	var headerRemoveFlags multiFlag
@@ -300,6 +301,7 @@ func main() {
 			AllowedIPs:    e.allowIPs,
 			DeniedIPs:     e.denyIPs,
 			CustomDomain:  e.customDomain,
+			PreserveHost:  *preserveHost,
 		}
 
 		wg.Add(1)
