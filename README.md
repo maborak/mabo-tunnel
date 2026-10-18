@@ -78,6 +78,23 @@ shape of tool for people who already have a VPS and a domain:
 
 ## Install
 
+### Installer (Linux/macOS)
+
+Install all three tools, or choose just `client`, `server`, or `token`. The
+installer resolves the latest GitHub release, verifies each binary against its
+`SHA256SUMS.txt`, installs user-locally to `~/.local/bin` by default, sets
+executable permissions, and offers to add the directory to the detected shell's
+PATH config. It does not require `sudo`. Use `--dir` or `DESTDIR` for another
+location, and `--no-modify-path` to leave shell config untouched.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maborak/mabo-tunnel/main/install.sh | bash
+# Or install only one:
+curl -fsSL https://raw.githubusercontent.com/maborak/mabo-tunnel/main/install.sh | bash -s -- --component client
+# Pin a release:
+curl -fsSL https://raw.githubusercontent.com/maborak/mabo-tunnel/main/install.sh | bash -s -- --version v1.2.3
+```
+
 ### Download a release
 
 Grab a binary for your platform from the
