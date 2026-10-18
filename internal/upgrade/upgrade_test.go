@@ -397,7 +397,7 @@ func assertExeReplaced(t *testing.T, exe string, files map[string][]byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm()&0o111 == 0 {
+	if runtime.GOOS != "windows" && fi.Mode().Perm()&0o111 == 0 {
 		t.Errorf("exec bit lost: perm = %o", fi.Mode().Perm())
 	}
 	entries, err := os.ReadDir(filepath.Dir(exe))
@@ -481,8 +481,8 @@ func TestRunFailuresLeaveOriginalIntact(t *testing.T) {
 }
 
 func TestRunMissingAssetForPlatform(t *testing.T) {
-	// Release only carries linux/amd64 — any other platform must get the
-	// typed error without downloading anything.
+	// The simulated release only carries linux/amd64; ask for a platform the
+	// release does not ship, independent of the host running this test.
 	files := map[string][]byte{
 		"mabo-tunnel-client-linux-amd64": []byte("payload"),
 		checksumsNm:                      []byte("deadbeef  mabo-tunnel-client-linux-amd64\n"),
@@ -490,11 +490,11 @@ func TestRunMissingAssetForPlatform(t *testing.T) {
 	fg := newFakeGH(t, "v1.1.0", files)
 	exe := seedExe(t)
 
-	_, err := Run(context.Background(), Options{
+	_, err := runForPlatform(context.Background(), Options{
 		Binary: "client", Current: "v1.0.0", BaseURL: fg.srv.URL,
 		Client: fg.srv.Client(), Target: exe,
 		Stdout: io.Discard, Stderr: io.Discard,
-	})
+	}, "freebsd", "amd64")
 	if !errors.Is(err, ErrUnsupportedPlatform) && !strings.Contains(err.Error(), "need asset") {
 		t.Fatalf("err = %v, want unsupported-platform error naming the asset", err)
 	}

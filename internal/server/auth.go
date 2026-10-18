@@ -77,7 +77,7 @@ func handleAuth(conn *websocket.Conn, users *auth.UserStore, limiter *auth.RateL
 	// failures accumulate — and a connection that never presents a guess is
 	// not charged for one.
 	if !limiter.Take(remoteAddr) {
-		logger.Warn("auth rate limited", "ip", remoteAddr)
+		logger.Warn("auth rate limited", "ip", strings.ReplaceAll(strings.ReplaceAll(remoteAddr, "\r", ""), "\n", ""))
 		metrics.Inc("mabo_auth_failures_total", "")
 		metrics.Inc("mabo_auth_rate_limited_total", "")
 		sendAuthResponse(conn, false, "Too many auth attempts, try again later", nil)

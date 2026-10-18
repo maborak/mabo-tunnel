@@ -792,7 +792,7 @@ func (p *ProxyHandler) checkIPAccess(r *http.Request, tunnel *Tunnel) bool {
 		return true
 	}
 	p.logger.Warn("requester IP is not allowed to access tunnel",
-		"ip", clientIP,
+		"ip", strings.ReplaceAll(strings.ReplaceAll(clientIP, "\r", ""), "\n", ""),
 		"tunnel_id", tunnel.ID,
 	)
 	return false

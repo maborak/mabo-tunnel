@@ -45,10 +45,9 @@ func (s *Server) authorizeAdmin(w http.ResponseWriter, r *http.Request) bool {
 	}
 	if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(s.config.AdminToken)) != 1 {
 		s.metrics.Inc("mabo_admin_auth_failures_total", "")
-		s.logger.Warn("admin API auth failed",
-			"ip", s.proxy.extractClientIP(r),
-			"path", r.URL.Path,
-		)
+		// Do not echo request-controlled IP/path strings into logs. The counter
+		// records the event without risking log forgery from malformed headers.
+		s.logger.Warn("admin API auth failed")
 		w.Header().Set("WWW-Authenticate", `Bearer realm="mabo-tunnel-admin"`)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false

@@ -110,16 +110,16 @@ func (ld *LocalDashboard) Start(addr string) error {
 	}
 
 	port := ln.Addr().(*net.TCPAddr).Port
-	ld.mu.Lock()
-	ld.actualAddr = fmt.Sprintf("http://localhost:%d", port)
-	ld.mu.Unlock()
-	close(ld.ready)
-
-	ld.server = &http.Server{
+	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 20 * time.Second,
 	}
-	return ld.server.Serve(ln)
+	ld.mu.Lock()
+	ld.actualAddr = fmt.Sprintf("http://localhost:%d", port)
+	ld.server = server
+	ld.mu.Unlock()
+	close(ld.ready)
+	return server.Serve(ln)
 }
 
 // loopbackAddr forces a listen address onto the loopback interface: the port
@@ -155,8 +155,11 @@ func (ld *LocalDashboard) URL() string {
 
 // Stop shuts down the dashboard server.
 func (ld *LocalDashboard) Stop() {
-	if ld.server != nil {
-		ld.server.Close()
+	ld.mu.RLock()
+	server := ld.server
+	ld.mu.RUnlock()
+	if server != nil {
+		server.Close()
 	}
 }
 
