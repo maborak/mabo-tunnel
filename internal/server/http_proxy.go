@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,13 +25,14 @@ const maxRequestBodySize = 10 * 1024 * 1024
 const reqChunkSize = 32 * 1024
 
 // defaultTrustedProxies are the ranges an X-Forwarded-For header is honored
-// from when none are configured: loopback and the private ranges a reverse
-// proxy or container network lives on. A request arriving directly from the
-// public internet is never trusted to describe its own origin.
+// from when none are configured: loopback only, the reverse proxy on the same
+// host. A proxy on a container network or another private host must be named
+// explicitly with --trusted-proxies. Trusting the private ranges by default
+// let every host that could reach the server — any neighbour on the LAN or
+// the container network — describe its own origin, choosing its own
+// rate-limit bucket and bypassing IP allow lists.
 var defaultTrustedProxies = []string{
 	"127.0.0.0/8", "::1/128",
-	"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-	"fc00::/7",
 }
 
 // defaultFirstEventTimeout bounds how long a proxied request waits for the
@@ -54,7 +56,8 @@ func (p *ProxyHandler) SetMetrics(m *Metrics) {
 }
 
 // NewProxyHandler creates a new ProxyHandler. trustedProxies is a list of
-// CIDRs whose X-Forwarded-For headers are believed; empty means the defaults.
+// CIDRs whose X-Forwarded-For headers are believed; empty means the defaults
+// (loopback only).
 func NewProxyHandler(tunnels *TunnelManager, domain string, trustedProxies []string, firstEventTimeout time.Duration, logger *slog.Logger) *ProxyHandler {
 	if firstEventTimeout <= 0 {
 		firstEventTimeout = defaultFirstEventTimeout
@@ -77,7 +80,7 @@ func NewProxyHandler(tunnels *TunnelManager, domain string, trustedProxies []str
 	}
 	return &ProxyHandler{
 		tunnels:           tunnels,
-		domain:            domain,
+		domain:            strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), ".")),
 		logger:            logger,
 		trustedProxies:    nets,
 		firstEventTimeout: firstEventTimeout,
@@ -93,21 +96,25 @@ func isWebSocketUpgrade(r *http.Request) bool {
 // ServeHTTP routes incoming requests to the appropriate tunnel.
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.metrics.Inc("mabo_http_requests_total", "")
-	subdomain := p.extractSubdomain(r.Host)
-	if subdomain == "" {
-		// Not a <subdomain>.<base-domain> request — try a registered custom
-		// hostname before giving up.
-		tunnel, customOk := p.tunnels.LookupCustom(hostWithoutPort(r.Host))
-		if !customOk {
-			http.Error(w, "No tunnel specified. Use <subdomain>."+p.domain, http.StatusBadRequest)
+	host := normalizeHost(r.Host)
+
+	// Resolve the target tunnel from the host once: a
+	// <subdomain>.<base-domain> host names its tunnel directly, anything else
+	// must be a registered custom hostname. Resolving twice — custom lookup
+	// first, then a byHost lookup of whatever subdomain the custom tunnel
+	// happened to carry — let a custom-domain request be rerouted to whichever
+	// other user held that subdomain.
+	var tunnel *Tunnel
+	if sub := p.extractSubdomain(host); sub != "" {
+		var ok bool
+		if tunnel, ok = p.tunnels.LookupByHost(sub); !ok {
+			http.Error(w, fmt.Sprintf("Tunnel %q not found. It may have been closed.", sub), http.StatusNotFound)
 			return
 		}
-		subdomain = tunnel.Subdomain
-	}
-
-	tunnel, ok := p.tunnels.LookupByHost(subdomain)
-	if !ok {
-		http.Error(w, fmt.Sprintf("Tunnel %q not found. It may have been closed.", subdomain), http.StatusNotFound)
+	} else if t, ok := p.tunnels.LookupCustom(host); ok {
+		tunnel = t
+	} else {
+		http.Error(w, "No tunnel specified. Use <subdomain>."+p.domain, http.StatusBadRequest)
 		return
 	}
 
@@ -124,13 +131,15 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		// The edge consumed this credential; forwarding it would hand the
+		// tunneled app a credential meant for the edge (F-17).
+		r.Header.Del("Authorization")
 	}
 
 	// Per-tunnel request-rate cap. The bucket belongs to the tunnel, so the
 	// limit travels with the tunnel across reconnects and is shared by every
 	// concurrent public caller hammering it.
 	if tunnel.rateLimiter != nil && !tunnel.rateLimiter.allow() {
-		p.metrics.Inc("mabo_http_responses_total", statusClass(429))
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 		return
@@ -152,8 +161,19 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tunnel.pendingCount.Add(-1)
 
-	// WebSocket upgrade requests get special bidirectional handling.
-	if isWebSocketUpgrade(r) {
+	// WebSocket upgrade requests get special bidirectional handling. The check
+	// runs before hop-by-hop stripping so the upgrade tokens survive it.
+	isUpgrade := isWebSocketUpgrade(r)
+
+	// Headers that describe the caller's connection rather than the request
+	// must not cross the tunnel hop, and the app behind the tunnel needs the
+	// origin information this edge verified instead of the caller's word for
+	// it.
+	stripHopByHopRequest(r, isUpgrade)
+	p.setForwardedFor(r)
+	p.setForwardedProto(r)
+
+	if isUpgrade {
 		p.handleWebSocketProxy(w, r, tunnel)
 		return
 	}
@@ -172,7 +192,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 
 	p.logger.Debug("proxying request",
-		"subdomain", subdomain,
+		"subdomain", tunnel.Subdomain,
 		"method", r.Method,
 		"path", r.URL.Path,
 		"tunnel_id", tunnel.ID,
@@ -180,12 +200,8 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Forward the request head only. The body streams behind it as its own
 	// frames, so a large upload starts reaching the local server immediately
-	// instead of being buffered whole at the edge first.
-	//
-	// Record the origin first: the head carries whatever X-Forwarded-For the
-	// caller (or an edge proxy) supplied, and the app behind the tunnel has
-	// no other way to learn an address this server actually verified.
-	p.setForwardedFor(r)
+	// instead of being buffered whole at the edge first. The forwarded origin
+	// headers were stamped above; the head now carries them into the tunnel.
 	rawHead, err := httputil.DumpRequest(r, false)
 	if err != nil {
 		p.logger.Error("failed to dump request", "error", err)
@@ -350,10 +366,9 @@ func (p *ProxyHandler) streamResponse(w http.ResponseWriter, r *http.Request, tu
 					continue
 				}
 				copyResponseHeaders(w, ev.Header.Headers)
-				w.Header().Set("X-Mabo Tunnel-Tunnel", tunnel.ID)
+				w.Header().Set("X-Mabo-Tunnel-Tunnel", tunnel.ID)
 				w.WriteHeader(ev.Header.StatusCode)
 				headersWritten = true
-				p.metrics.Inc("mabo_http_responses_total", statusClass(ev.Header.StatusCode))
 				if flusher != nil {
 					flusher.Flush()
 				}
@@ -425,6 +440,27 @@ func (p *ProxyHandler) sendClose(tunnel *Tunnel, connID, reason string) {
 // handleWebSocketProxy handles a WebSocket upgrade request by hijacking the
 // connection and using bidirectional streaming through the tunnel.
 func (p *ProxyHandler) handleWebSocketProxy(w http.ResponseWriter, r *http.Request, tunnel *Tunnel) {
+	// An upgrade request holds a slot in the small upgrade-pending pool until
+	// the tunnel peer answers; an established passthrough moves back to the
+	// general in-flight budget. Without this, a caller who only sends upgrade
+	// requests and never completes a handshake could hold the tunnel's whole
+	// 200-request budget and take a live tunnel offline (F-03).
+	if n := tunnel.upgradePending.Add(1); n > maxUpgradePendingPerTunnel {
+		tunnel.upgradePending.Add(-1)
+		p.logger.Warn("tunnel at WebSocket upgrade limit",
+			"tunnel_id", tunnel.ID,
+			"limit", maxUpgradePendingPerTunnel,
+		)
+		http.Error(w, "Tunnel is at its WebSocket upgrade limit", http.StatusServiceUnavailable)
+		return
+	}
+	slotHeld := true
+	defer func() {
+		if slotHeld {
+			tunnel.upgradePending.Add(-1)
+		}
+	}()
+
 	connID, err := generateTunnelID()
 	if err != nil {
 		p.logger.Error("failed to generate ws conn ID", "error", err)
@@ -439,9 +475,8 @@ func (p *ProxyHandler) handleWebSocketProxy(w http.ResponseWriter, r *http.Reque
 	)
 
 	// Dump the raw upgrade request to forward to the client. An upgrade has no
-	// body, so the head is the whole request. Set the verified origin first,
-	// same as the plain proxy path.
-	p.setForwardedFor(r)
+	// body, so the head is the whole request; the caller already sanitized the
+	// headers and stamped the verified origin.
 	rawReq, err := httputil.DumpRequest(r, false)
 	if err != nil {
 		p.logger.Error("failed to dump WebSocket request", "error", err)
@@ -468,8 +503,9 @@ func (p *ProxyHandler) handleWebSocketProxy(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Wait for the initial response (the 101 Switching Protocols + subsequent data).
-	// First response contains the HTTP 101 upgrade response.
+	// Wait for the peer's upgrade response under a short deadline: a live
+	// local server answers in milliseconds, and every second of wait is a
+	// slot an attacker can hold.
 	var firstResponse []byte
 	select {
 	case firstResponse = <-proxiedConn.DataCh:
@@ -480,8 +516,25 @@ func (p *ProxyHandler) handleWebSocketProxy(w http.ResponseWriter, r *http.Reque
 	case <-tunnel.done:
 		http.Error(w, "Tunnel closed during WebSocket upgrade", http.StatusBadGateway)
 		return
-	case <-time.After(30 * time.Second):
+	case <-time.After(wsUpgradeTimeout):
 		http.Error(w, "WebSocket upgrade timeout", http.StatusGatewayTimeout)
+		return
+	}
+	// The handshake answered; the connection is no longer pending.
+	slotHeld = false
+	tunnel.upgradePending.Add(-1)
+
+	// The tunnel peer is untrusted code: nothing but a well-formed 101 head
+	// may reach the visitor as the HTTP response. Forwarding its bytes
+	// verbatim would let it emit an arbitrary status line or a whole second
+	// response into a connection the edge has stopped parsing (S-18/D-018).
+	upgradeHead, upgradeTail, ok := parseUpgradeResponse(firstResponse)
+	if !ok {
+		p.logger.Warn("tunnel peer did not answer a WebSocket upgrade with 101",
+			"tunnel_id", tunnel.ID,
+			"conn_id", connID,
+		)
+		http.Error(w, "Tunnel peer did not complete the WebSocket upgrade", http.StatusBadGateway)
 		return
 	}
 
@@ -503,10 +556,17 @@ func (p *ProxyHandler) handleWebSocketProxy(w http.ResponseWriter, r *http.Reque
 	// lifetime is the WebSocket's, not the HTTP request's.
 	clientConn.SetDeadline(time.Time{})
 
-	// Write the initial upgrade response to the browser/client.
-	if _, err := clientConn.Write(firstResponse); err != nil {
+	// Write the peer's validated 101 head, followed by any post-upgrade bytes
+	// that arrived with it (a server may send its first frame immediately).
+	if _, err := clientConn.Write(upgradeHead); err != nil {
 		p.logger.Error("failed to write upgrade response", "error", err)
 		return
+	}
+	if len(upgradeTail) > 0 {
+		if _, err := clientConn.Write(upgradeTail); err != nil {
+			p.logger.Error("failed to write post-upgrade data", "error", err)
+			return
+		}
 	}
 	clientBuf.Flush()
 
@@ -560,6 +620,21 @@ func (p *ProxyHandler) handleWebSocketProxy(w http.ResponseWriter, r *http.Reque
 	}
 }
 
+// parseUpgradeResponse validates that a tunnel peer's first bytes are an HTTP
+// 101 response and splits the response head from any post-upgrade bytes that
+// followed it. The peer is untrusted code, so only a well-formed 101 head may
+// reach the visitor as the HTTP response.
+func parseUpgradeResponse(data []byte) (head, tail []byte, ok bool) {
+	src := bytes.NewReader(data)
+	br := bufio.NewReader(src)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
+		return nil, nil, false
+	}
+	consumed := len(data) - src.Len() - br.Buffered()
+	return data[:consumed], data[consumed:], true
+}
+
 // copyResponseHeaders writes a tunnel peer's response headers onto the public
 // response, minus what must not cross a proxy hop.
 //
@@ -602,6 +677,27 @@ func connectionNamedHeaders(headers map[string][]string) map[string]bool {
 	return named
 }
 
+// stripHopByHopRequest removes request headers that describe the caller's
+// connection rather than the request itself, plus every header the caller's
+// Connection header names. Without this, `Connection: X-Secret` makes
+// X-Secret hop-by-hop and a tunnel peer that forwards it into the app's
+// request stream would turn the caller's connection metadata into an app
+// header. The upgrade pair (Connection, Upgrade) is preserved for genuine
+// upgrades so the tunneled server can complete the handshake.
+func stripHopByHopRequest(r *http.Request, isUpgrade bool) {
+	named := connectionNamedHeaders(r.Header)
+	for key := range r.Header {
+		canonical := http.CanonicalHeaderKey(key)
+		if !protocol.HopByHopHeaders[canonical] && !named[canonical] {
+			continue
+		}
+		if isUpgrade && (canonical == "Connection" || canonical == "Upgrade") {
+			continue
+		}
+		r.Header.Del(key)
+	}
+}
+
 // writeRawResponse handles the legacy TypeData path where the tunnel client
 // sent the entire HTTP response as a single buffered blob. It parses the blob
 // and streams the body with flushes, same as before.
@@ -610,7 +706,7 @@ func (p *ProxyHandler) writeRawResponse(w http.ResponseWriter, r *http.Request, 
 	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(data)), r)
 	if err != nil {
 		// Not a valid HTTP response — write as plain body.
-		w.Header().Set("X-Mabo Tunnel-Tunnel", tunnelID)
+		w.Header().Set("X-Mabo-Tunnel-Tunnel", tunnelID)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		w.Write(data)
@@ -619,7 +715,7 @@ func (p *ProxyHandler) writeRawResponse(w http.ResponseWriter, r *http.Request, 
 	defer resp.Body.Close()
 
 	copyResponseHeaders(w, resp.Header)
-	w.Header().Set("X-Mabo Tunnel-Tunnel", tunnelID)
+	w.Header().Set("X-Mabo-Tunnel-Tunnel", tunnelID)
 
 	w.WriteHeader(resp.StatusCode)
 
@@ -650,8 +746,28 @@ func hostWithoutPort(host string) string {
 	return strings.Trim(host, "[]")
 }
 
+// normalizeHost canonicalizes a Host header value: lowercase (DNS names are
+// case-insensitive), no trailing dot, no port. A malformed or out-of-range
+// port yields "" — the request then names no tunnel rather than one chosen by
+// whatever the caller typed. Every host-keyed lookup runs on this form.
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	if h, port, err := net.SplitHostPort(host); err == nil {
+		if port != "" {
+			if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+				return ""
+			}
+		}
+		host = h
+	} else {
+		host = strings.Trim(host, "[]")
+	}
+	host = strings.TrimSuffix(host, ".")
+	return strings.ToLower(host)
+}
+
 func (p *ProxyHandler) extractSubdomain(host string) string {
-	host = hostWithoutPort(host)
+	host = normalizeHost(host)
 
 	suffix := "." + p.domain
 	if !strings.HasSuffix(host, suffix) {
@@ -671,64 +787,51 @@ func (p *ProxyHandler) extractSubdomain(host string) string {
 // only listed networks are permitted. Both lists hold CIDRs; a bare IP was
 // normalized to /32 or /128 at the handshake.
 func (p *ProxyHandler) checkIPAccess(r *http.Request, tunnel *Tunnel) bool {
-	if len(tunnel.deniedNets) == 0 && len(tunnel.allowedNets) == 0 {
+	clientIP := p.extractClientIP(r)
+	if tunnel.ipAllowed(net.ParseIP(clientIP)) {
 		return true
 	}
-
-	clientIP := net.ParseIP(p.extractClientIP(r))
-	if clientIP == nil {
-		// We could not establish an origin. With an allow list configured the
-		// safe answer is no.
-		return len(tunnel.allowedNets) == 0
-	}
-
-	// Check deny list first.
-	for _, denied := range tunnel.deniedNets {
-		if denied.Contains(clientIP) {
-			p.logger.Warn("IP denied by deny list",
-				"ip", clientIP.String(),
-				"cidr", denied.String(),
-				"tunnel_id", tunnel.ID,
-			)
-			return false
-		}
-	}
-
-	// If allow list is non-empty, only listed networks are permitted.
-	if len(tunnel.allowedNets) > 0 {
-		for _, allowed := range tunnel.allowedNets {
-			if allowed.Contains(clientIP) {
-				return true
-			}
-		}
-		p.logger.Warn("IP not in allow list",
-			"ip", clientIP.String(),
-			"tunnel_id", tunnel.ID,
-		)
-		return false
-	}
-
-	return true
+	p.logger.Warn("requester IP is not allowed to access tunnel",
+		"ip", clientIP,
+		"tunnel_id", tunnel.ID,
+	)
+	return false
 }
 
 // setForwardedFor appends the verified requester origin to the request's
 // X-Forwarded-For chain before the head is forwarded through the tunnel.
 //
-// Every proxy hop appends the address it received the request from; that is
-// the contract apps behind the tunnel read (rightmost = closest proxy, and
-// ours is the one this server controls). Without this, the chain the caller
-// typed arrives untouched and an app trusting it authenticates whichever IP
-// the caller chose.
+// Every proxy hop appends the address it received the request from, without
+// rewriting what earlier hops recorded, so the rightmost entry is the hop
+// closest to this edge — the one an app behind the tunnel can act on. The old
+// version read only the first X-Forwarded-For header, replaced the whole chain
+// with it, and appended a second copy of the address derived for rate limiting.
 func (p *ProxyHandler) setForwardedFor(r *http.Request) {
-	clientIP := p.extractClientIP(r)
-	if clientIP == "" {
+	remote := hostWithoutPort(r.RemoteAddr)
+	if remote == "" {
 		return
 	}
-	if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
-		r.Header.Set("X-Forwarded-For", prior+", "+clientIP)
-	} else {
-		r.Header.Set("X-Forwarded-For", clientIP)
+	chain := append([]string(nil), r.Header.Values("X-Forwarded-For")...)
+	chain = append(chain, remote)
+	r.Header.Set("X-Forwarded-For", strings.Join(chain, ", "))
+}
+
+// setForwardedProto stamps the scheme the request arrived with so the tunneled
+// app does not have to guess. An operator-declared trusted proxy may describe
+// it (TLS often terminates there); otherwise the scheme comes from this
+// connection and a caller-supplied value is discarded.
+func (p *ProxyHandler) setForwardedProto(r *http.Request) {
+	proto := ""
+	if p.isTrustedProxy(hostWithoutPort(r.RemoteAddr)) {
+		proto = strings.ToLower(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")))
 	}
+	if proto != "http" && proto != "https" {
+		proto = "http"
+		if r.TLS != nil {
+			proto = "https"
+		}
+	}
+	r.Header.Set("X-Forwarded-Proto", proto)
 }
 
 // notifyBodyTooLarge sends an out-of-band notice to the tunnel owner so the

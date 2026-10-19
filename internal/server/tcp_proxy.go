@@ -57,6 +57,43 @@ func (tp *TCPProxy) Serve() {
 
 // handleConnection manages a single TCP connection through the tunnel.
 func (tp *TCPProxy) handleConnection(conn net.Conn) {
+	// Enforce the tunnel's IP allow/deny lists here too. The HTTP path checks
+	// them per request; without this, the same tunnel's TCP port ignored the
+	// lists entirely and any host that could reach the port got in (F-04).
+	var remoteIP net.IP
+	if host, _, err := net.SplitHostPort(conn.RemoteAddr().String()); err == nil {
+		remoteIP = net.ParseIP(host)
+	}
+	if !tp.tunnel.ipAllowed(remoteIP) {
+		tp.logger.Warn("TCP connection rejected: IP not allowed",
+			"ip", conn.RemoteAddr().String(),
+			"tunnel_id", tp.tunnel.ID,
+		)
+		conn.Close()
+		return
+	}
+
+	// Same per-tunnel rate cap and in-flight budget as the HTTP path, so TCP
+	// cannot be used to sidestep either.
+	if tp.tunnel.rateLimiter != nil && !tp.tunnel.rateLimiter.allow() {
+		tp.logger.Warn("TCP connection rejected: tunnel rate limit",
+			"ip", conn.RemoteAddr().String(),
+			"tunnel_id", tp.tunnel.ID,
+		)
+		conn.Close()
+		return
+	}
+	if n := tp.tunnel.pendingCount.Add(1); n > maxProxiedPerTunnel {
+		tp.tunnel.pendingCount.Add(-1)
+		tp.logger.Warn("TCP connection rejected: tunnel at concurrent connection limit",
+			"tunnel_id", tp.tunnel.ID,
+			"limit", maxProxiedPerTunnel,
+		)
+		conn.Close()
+		return
+	}
+	defer tp.tunnel.pendingCount.Add(-1)
+
 	connID, err := generateTunnelID()
 	if err != nil {
 		tp.logger.Error("failed to generate TCP conn ID", "error", err)

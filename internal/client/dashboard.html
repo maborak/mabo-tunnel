@@ -620,19 +620,22 @@
     const btn = document.getElementById('replayBtn');
     btn.textContent = 'Sending...';
     try {
-      // Build the replay URL from the tunnel URL + request path.
-      const tunnelURL = await getTunnelURL(currentReq.tunnel_id);
-      if (!tunnelURL) { btn.textContent = 'No tunnel URL'; return; }
-      const url = tunnelURL + currentReq.path;
+      // Replay through the local API, which forwards the request through the
+      // tunnel and reports the status back. The custom header is the
+      // same-origin guard on state-changing routes.
+      const resp = await fetch(
+        API + '/tunnels/' + currentReq.tunnel_id + '/requests/' + currentReq.id + '/replay',
+        { method: 'POST', headers: { 'X-Mabo-Tunnel-Dashboard': '1' } });
 
-      const resp = await fetch(url, {
-        method: currentReq.method,
-        headers: currentReq.method !== 'GET' && currentReq.method !== 'HEAD'
-          ? { 'Content-Type': 'application/json' } : {},
-        mode: 'no-cors',
-      });
+      if (!resp.ok) {
+        btn.textContent = '✗ Failed';
+        btn.classList.add('error');
+        setTimeout(() => { btn.textContent = '▶ Replay'; btn.classList.remove('error'); }, 2000);
+        return;
+      }
+      const result = await resp.json();
 
-      btn.textContent = '✓ Replayed';
+      btn.textContent = '✓ Replayed (' + result.response + ')';
       btn.classList.add('success');
       setTimeout(() => { btn.textContent = '▶ Replay'; btn.classList.remove('success'); }, 2000);
 
@@ -644,14 +647,6 @@
       setTimeout(() => { btn.textContent = '▶ Replay'; btn.classList.remove('error'); }, 2000);
     }
   });
-
-  async function getTunnelURL(tunnelID) {
-    try {
-      const tunnels = await api('/tunnels');
-      const t = tunnels.find(t => t.id === tunnelID);
-      return t ? t.subdomain : null; // subdomain field holds the full URL
-    } catch { return null; }
-  }
 
   // --- Close detail ---
   document.getElementById('closeDetail').addEventListener('click', hideDetail);

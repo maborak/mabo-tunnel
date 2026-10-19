@@ -166,8 +166,10 @@ func TestReadyEndpoint(t *testing.T) {
 	if result["status"] != "ready" {
 		t.Fatalf("expected status=ready, got %v", result["status"])
 	}
-	if result["users_loaded"] == nil || result["users_loaded"].(float64) < 1 {
-		t.Fatalf("expected users_loaded >= 1, got %v", result["users_loaded"])
+	// /ready is unauthenticated infrastructure surface: readiness only, no
+	// business detail such as how many users are loaded.
+	if _, ok := result["users_loaded"]; ok {
+		t.Fatalf("/ready must not expose users_loaded, got %v", result["users_loaded"])
 	}
 	t.Logf("PASS: /ready returned %s", string(body))
 }

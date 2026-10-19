@@ -71,9 +71,18 @@ func (ld *LocalDashboard) AddTunnel(id, url string, localPort int, name string) 
 	})
 }
 
-// Start starts the local dashboard HTTP server on the given address.
-// Use ":0" to bind to a random available port.
+// Start starts the local dashboard HTTP server. The host is loopback, always:
+// the dashboard exposes captured request and response bodies, so a wildcard or
+// LAN bind would publish a user's traffic to their network. The port may be 0
+// to pick a free one; an explicit non-loopback host is refused rather than
+// silently honored.
 func (ld *LocalDashboard) Start(addr string) error {
+	addr, err := loopbackAddr(addr)
+	if err != nil {
+		close(ld.ready)
+		return err
+	}
+
 	mux := http.NewServeMux()
 
 	// Dashboard UI
@@ -106,8 +115,29 @@ func (ld *LocalDashboard) Start(addr string) error {
 	ld.mu.Unlock()
 	close(ld.ready)
 
-	ld.server = &http.Server{Handler: mux}
+	ld.server = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 20 * time.Second,
+	}
 	return ld.server.Serve(ln)
+}
+
+// loopbackAddr forces a listen address onto the loopback interface: the port
+// is whatever the caller asked for, the host is not negotiable.
+func loopbackAddr(addr string) (string, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("invalid dashboard address %q: %w", addr, err)
+	}
+	switch {
+	case host == "" || strings.EqualFold(host, "localhost"):
+		host = "127.0.0.1"
+	default:
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			return "", fmt.Errorf("dashboard address %q is not loopback; the dashboard exposes captured traffic and must bind 127.0.0.1", addr)
+		}
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 // WaitReady blocks until the dashboard has bound its port (or failed).
@@ -356,9 +386,9 @@ func localOnly(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // requireLocalRequest guards state-changing endpoints against cross-site
-// requests. A cross-origin fetch cannot set X-Mabo Tunnel-Dashboard without
+// requests. A cross-origin fetch cannot set X-Mabo-Tunnel-Dashboard without
 // triggering a preflight, and we answer no preflight, so only the dashboard's
 // own scripts can reach these.
 func requireLocalRequest(r *http.Request) bool {
-	return r.Header.Get("X-Mabo Tunnel-Dashboard") != ""
+	return r.Header.Get("X-Mabo-Tunnel-Dashboard") != ""
 }

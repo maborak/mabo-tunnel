@@ -142,8 +142,13 @@ func (rl *RateLimiter) sweep() {
 	}
 }
 
-// Allow checks if an IP is allowed to attempt authentication.
-func (rl *RateLimiter) Allow(ip string) bool {
+// Take atomically checks the rate limit and records this attempt. It reports
+// false when the address has exhausted its budget; a false result records
+// nothing, so hammering during a lockout does not extend it.
+//
+// This is deliberately one operation: a separate check-then-record pair let N
+// concurrent attempts all observe the same pre-attempt state and all pass.
+func (rl *RateLimiter) Take(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
@@ -158,28 +163,43 @@ func (rl *RateLimiter) Allow(ip string) bool {
 			valid = append(valid, t)
 		}
 	}
-	if len(valid) == 0 {
-		delete(rl.attempts, ip)
-	} else {
-		rl.attempts[ip] = valid
+
+	if len(valid) >= rl.maxRate {
+		// Over budget: keep the pruned history, consume nothing.
+		if len(valid) == 0 {
+			delete(rl.attempts, ip)
+		} else {
+			rl.attempts[ip] = valid
+		}
+		return false
 	}
-
-	return len(valid) < rl.maxRate
-}
-
-// Record records a failed auth attempt for an IP.
-func (rl *RateLimiter) Record(ip string) {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
 
 	// Shed the stalest entries if we are at the cap, so a distributed spray of
 	// bad tokens cannot grow this map indefinitely.
-	if len(rl.attempts) >= rl.maxIPs {
-		if _, tracked := rl.attempts[ip]; !tracked {
-			rl.evictOldestLocked()
-		}
+	if _, tracked := rl.attempts[ip]; !tracked && len(rl.attempts) >= rl.maxIPs {
+		rl.evictOldestLocked()
 	}
-	rl.attempts[ip] = append(rl.attempts[ip], time.Now())
+	rl.attempts[ip] = append(valid, now)
+	return true
+}
+
+// Refund removes one recorded attempt for an address, so a successful
+// authentication does not consume the address's budget — the limiter exists to
+// slow guessing, not to lock out healthy reconnects.
+func (rl *RateLimiter) Refund(ip string) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	attempts := rl.attempts[ip]
+	if len(attempts) == 0 {
+		return
+	}
+	attempts = attempts[:len(attempts)-1]
+	if len(attempts) == 0 {
+		delete(rl.attempts, ip)
+	} else {
+		rl.attempts[ip] = attempts
+	}
 }
 
 // evictOldestLocked removes the entry with the oldest most-recent attempt.

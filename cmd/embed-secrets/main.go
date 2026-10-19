@@ -119,7 +119,10 @@ func main() {
 	b.WriteString(fmt.Sprintf("\tif v, err := secrets.Decrypt(key, %s); err == nil { embeddedUsersData = string(v) }\n", goBytes(encUsersData)))
 	b.WriteString("}\n")
 
-	if err := os.WriteFile(*output, []byte(b.String()), 0644); err != nil {
+	// 0600: the file is encrypted, but it is still the one artifact on disk
+	// holding the token database; a failed or interrupted build must not leave
+	// a world-readable copy behind.
+	if err := os.WriteFile(*output, []byte(b.String()), 0600); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing output: %v\n", err)
 		os.Exit(1)
 	}

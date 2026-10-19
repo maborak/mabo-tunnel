@@ -97,6 +97,17 @@ func (m *Metrics) Inc(name, labelValue string) {
 	c.series[labelValue]++
 }
 
+// RecordHTTPResponse counts one completed HTTP response under
+// mabo_http_responses_total. A zero status (nothing was written, e.g. the
+// connection was hijacked into a WebSocket) is not an HTTP response and is
+// not counted.
+func (m *Metrics) RecordHTTPResponse(status int) {
+	if status == 0 {
+		return
+	}
+	m.Inc("mabo_http_responses_total", statusClass(status))
+}
+
 // statusClass buckets an HTTP status into a Prometheus label value.
 func statusClass(code int) string {
 	switch {

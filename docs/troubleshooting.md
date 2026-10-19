@@ -142,11 +142,13 @@ The tunnel has HTTP Basic Auth (`--auth user:pass`). Supply credentials.
 Logs and IP rules show the reverse proxy's address instead of the real client.
 
 `X-Forwarded-For` is believed **only** when the request arrives from a CIDR in
-`--trusted-proxies` (default: loopback and private ranges). Behind a proxy on a
-public address, set it explicitly:
+`--trusted-proxies` (default: loopback only). A proxy in a container or on
+another host needs its network named explicitly — the shipped
+`docker-compose.yml` passes the compose subnet for its Caddy container:
 
 ```bash
-mabo-tunnel-server --trusted-proxies=203.0.113.10/32,10.0.0.0/8
+mabo-tunnel-server --trusted-proxies=172.28.0.0/24     # the compose network
+mabo-tunnel-server --trusted-proxies=203.0.113.10/32   # a proxy elsewhere
 ```
 
 This is deliberately fail-closed: trusting the header from an untrusted peer

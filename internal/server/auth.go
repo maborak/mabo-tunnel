@@ -11,6 +11,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// maxSessionIDLen bounds the reconnect session identifier a client may send:
+// it keys a reservation entry and is echoed into logs, and no legitimate
+// client needs more than a short opaque identifier.
+const maxSessionIDLen = 128
+
 // authResult holds the result of a successful authentication.
 type authResult struct {
 	User         *auth.User
@@ -33,61 +38,69 @@ func handleAuth(conn *websocket.Conn, users *auth.UserStore, limiter *auth.RateL
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer conn.SetReadDeadline(time.Time{}) // clear after auth
 
-	// Rate limit check.
-	if !limiter.Allow(remoteAddr) {
-		logger.Warn("auth rate limited", "ip", remoteAddr)
-		// Drain the pending auth frame before rejecting: closing a
-		// connection that still has unread inbound data sends an abortive
-		// reset, and on Windows that reset destroys the rejection response
-		// before it reaches the peer.
-		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		_, _, _ = conn.ReadMessage()
-		sendAuthResponse(conn, false, "Too many auth attempts, try again later", nil)
+	// fail counts the handshake as rejected and answers the client. Every
+	// rejection path goes through it: a failure the metric cannot see is a
+	// blind spot in exactly the situation an operator is watching for.
+	fail := func(message string) *authResult {
+		metrics.Inc("mabo_auth_failures_total", "")
+		sendAuthResponse(conn, false, message, nil)
 		return nil
 	}
 
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
 		logger.Error("failed to read auth message", "error", err)
-		sendAuthResponse(conn, false, "Failed to read auth message", nil)
-		return nil
+		return fail("Failed to read auth message")
 	}
 
 	env, err := protocol.ParseEnvelope(msg)
 	if err != nil {
 		logger.Error("failed to parse auth envelope", "error", err)
-		sendAuthResponse(conn, false, "Invalid message format", nil)
-		return nil
+		return fail("Invalid message format")
 	}
 
 	if env.Type != protocol.TypeAuthRequest {
 		logger.Warn("expected auth_request", "got", env.Type)
-		sendAuthResponse(conn, false, "Expected auth_request as first message", nil)
-		return nil
+		return fail("Expected auth_request as first message")
 	}
 
 	var authReq protocol.AuthRequest
 	if err := env.ParsePayload(&authReq); err != nil {
 		logger.Error("failed to parse auth request", "error", err)
-		sendAuthResponse(conn, false, "Invalid auth request", nil)
+		return fail("Invalid auth request")
+	}
+
+	// A well-formed auth_request is one credential guess. Count and bound it
+	// in one atomic step, before the token is checked, so parallel guesses
+	// cannot each observe the same pre-attempt state and slip through
+	// together. A successful authentication refunds the slot below, so only
+	// failures accumulate — and a connection that never presents a guess is
+	// not charged for one.
+	if !limiter.Take(remoteAddr) {
+		logger.Warn("auth rate limited", "ip", remoteAddr)
+		metrics.Inc("mabo_auth_failures_total", "")
+		metrics.Inc("mabo_auth_rate_limited_total", "")
+		sendAuthResponse(conn, false, "Too many auth attempts, try again later", nil)
 		return nil
 	}
+	metrics.Inc("mabo_auth_attempts_total", "")
 
 	if authReq.Token == "" {
-		sendAuthResponse(conn, false, "Token is required", nil)
-		return nil
+		return fail("Token is required")
 	}
-
-	metrics.Inc("mabo_auth_attempts_total", "")
 
 	// Validate the token (constant-time comparison inside).
 	user, ok := users.Authenticate(authReq.Token)
 	if !ok {
-		limiter.Record(remoteAddr)
 		logger.Warn("authentication failed", "ip", remoteAddr)
-		metrics.Inc("mabo_auth_failures_total", "")
-		sendAuthResponse(conn, false, "Invalid token", nil)
-		return nil
+		return fail("Invalid token")
+	}
+	limiter.Refund(remoteAddr)
+
+	// A session ID keys a reconnect reservation and is echoed into logs; no
+	// legitimate client needs more than a short opaque identifier.
+	if len(authReq.SessionID) > maxSessionIDLen {
+		return fail("session_id too long (max 128 characters)")
 	}
 
 	logger.Info("authenticated", "username", user.Username, "plan", user.Plan)

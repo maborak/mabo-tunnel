@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -32,6 +33,15 @@ const (
 	maxMessageSize = 16 * 1024 * 1024
 	// Max concurrent proxied requests per tunnel.
 	maxProxiedPerTunnel = 200
+	// Max concurrent upgrade-pending WebSocket requests per tunnel: upgrade
+	// requests waiting for the tunnel peer's 101. Kept small and separate from
+	// the general in-flight budget so an unauthenticated caller cannot pin a
+	// live tunnel's whole capacity with fake handshakes (F-03).
+	maxUpgradePendingPerTunnel = 32
+	// How long the edge waits for the tunnel peer's upgrade response. A live
+	// local server answers in milliseconds; the wait only exists so a dead
+	// peer fails visibly.
+	wsUpgradeTimeout = 10 * time.Second
 	// WebSocket read/write buffer size. Large enough that a 32 KiB body chunk
 	// leaves in one or two socket writes instead of eleven.
 	wsBufferSize = 64 * 1024
@@ -47,7 +57,7 @@ type Config struct {
 	TCPPortMax    int // end of TCP port range for TCP tunnels (inclusive)
 
 	// TrustedProxies lists CIDRs whose X-Forwarded-For header is believed.
-	// Empty means loopback plus the private ranges.
+	// Empty means loopback only.
 	TrustedProxies []string
 
 	// LogLevel is "debug", "info", "warn", or "error". Empty means info.
@@ -104,6 +114,11 @@ type Config struct {
 	// "X-Admin-Token: <token>". Empty disables both endpoints entirely.
 	AdminToken string
 
+	// AdminListen, when set (e.g. "127.0.0.1:9999"), moves the admin API and
+	// /metrics to their own listener so they are not reachable through the
+	// public one. Empty keeps them on the main listener.
+	AdminListen string
+
 	// CustomDomains lists the zone suffixes under which clients may register
 	// their own verified hostnames (e.g. "apps.example.com" lets a user claim
 	// wilmer.apps.example.com after proving control via a TXT record). Empty
@@ -120,6 +135,7 @@ type Server struct {
 	proxy     *ProxyHandler
 	logger    *slog.Logger
 	mux       *http.ServeMux
+	adminMux  *http.ServeMux
 	upgrader  websocket.Upgrader
 	metrics   *Metrics
 	startedAt time.Time
@@ -160,6 +176,11 @@ func logPlaintextWarning(logger *slog.Logger, users *auth.UserStore) {
 
 // New creates a new Server instance.
 func New(cfg Config) (*Server, error) {
+	// DNS names are case-insensitive; keep configuration in one canonical form
+	// so every host comparison and URL built from it agrees.
+	cfg.Domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(cfg.Domain), "."))
+	cfg.ControlDomain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(cfg.ControlDomain), "."))
+
 	level := parseLogLevel(cfg.LogLevel)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: level,
@@ -208,6 +229,7 @@ func New(cfg Config) (*Server, error) {
 		tcpMax = 10100
 	}
 	tunnels := NewTunnelManager(cfg.Domain, tcpMin, tcpMax, logger)
+	tunnels.SetTCPBindHost(listenHost(cfg.Addr))
 	if cfg.PlanFreeLimit > 0 || cfg.PlanProLimit > 0 {
 		tunnels.SetPlanLimits(cfg.PlanFreeLimit, cfg.PlanProLimit)
 	}
@@ -221,8 +243,10 @@ func New(cfg Config) (*Server, error) {
 	metrics.Counter("mabo_tunnels_revoked_total", "Tunnels revoked via the admin API.", "")
 	metrics.Counter("mabo_auth_attempts_total", "Tunnel auth handshakes attempted.", "")
 	metrics.Counter("mabo_auth_failures_total", "Tunnel auth handshakes rejected.", "")
+	metrics.Counter("mabo_auth_rate_limited_total", "Auth handshakes rejected by the rate limiter.", "")
+	metrics.Counter("mabo_admin_auth_failures_total", "Admin API requests rejected for a bad or missing token.", "")
 	metrics.Counter("mabo_http_requests_total", "Public HTTP requests entering the proxy.", "")
-	metrics.Counter("mabo_http_responses_total", "Proxied responses by status class.", "status")
+	metrics.Counter("mabo_http_responses_total", "HTTP responses by status class.", "status")
 	proxy := NewProxyHandler(tunnels, cfg.Domain, cfg.TrustedProxies, cfg.UpstreamHeaderTimeout, logger)
 	proxy.SetMetrics(metrics)
 
@@ -260,12 +284,23 @@ func New(cfg Config) (*Server, error) {
 	s.mux.HandleFunc("/tunnel/connect", s.handleTunnelConnect)
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/ready", s.handleReady)
-	s.mux.HandleFunc("GET /admin/tunnels", s.handleAdminTunnels)
-	s.mux.HandleFunc("DELETE /admin/tunnels/{id}", s.handleAdminTunnelRevoke)
-	s.mux.HandleFunc("POST /admin/users/reload", s.handleAdminUsersReload)
-	s.mux.HandleFunc("GET /admin/stats", s.handleAdminStats)
-	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("/", s.handleRoot)
+
+	// The admin API and metrics expose the whole server's state. When
+	// --admin-listen names a separate listener they are registered only
+	// there; otherwise they stay on the main listener, token-guarded.
+	s.adminMux = http.NewServeMux()
+	registerAdmin := func(mux *http.ServeMux) {
+		mux.HandleFunc("GET /admin/tunnels", s.handleAdminTunnels)
+		mux.HandleFunc("DELETE /admin/tunnels/{id}", s.handleAdminTunnelRevoke)
+		mux.HandleFunc("POST /admin/users/reload", s.handleAdminUsersReload)
+		mux.HandleFunc("GET /admin/stats", s.handleAdminStats)
+		mux.HandleFunc("GET /metrics", s.handleMetrics)
+	}
+	registerAdmin(s.adminMux)
+	if cfg.AdminListen == "" {
+		registerAdmin(s.mux)
+	}
 
 	// Dashboard and API are served locally on the CLIENT side (localhost:4040).
 
@@ -280,6 +315,15 @@ func (s *Server) effectiveScheme() string {
 		return "https"
 	}
 	return "http"
+}
+
+// listenHost extracts the host part of a listen address ("host:port"). An
+// address with no host (":8080") means all interfaces and yields "".
+func listenHost(addr string) string {
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	return ""
 }
 
 // newHTTPServer builds an http.Server with timeouts suited to a tunnel edge.
@@ -388,15 +432,33 @@ func (s *Server) Close() {
 	s.shutdown()
 }
 
+// newAdminHTTPServer builds the optional second listener that serves only the
+// admin API and /metrics when --admin-listen is set; nil when it is not.
+func (s *Server) newAdminHTTPServer() *http.Server {
+	if s.config.AdminListen == "" {
+		return nil
+	}
+	srv := s.newHTTPServer(s.config.AdminListen)
+	srv.Handler = s.adminMux
+	return srv
+}
+
 // runPlain starts the plain HTTP server (original behavior, for use behind a reverse proxy).
 func (s *Server) runPlain(ctx context.Context) error {
 	httpServer := s.newHTTPServer(s.config.Addr)
+	adminServer := s.newAdminHTTPServer()
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
 		s.logger.Info("server starting", "addr", s.config.Addr, "domain", s.config.Domain, "version", version.Version)
 		errCh <- httpServer.ListenAndServe()
 	}()
+	if adminServer != nil {
+		go func() {
+			s.logger.Info("admin API listening", "addr", s.config.AdminListen)
+			errCh <- adminServer.ListenAndServe()
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -404,6 +466,9 @@ func (s *Server) runPlain(ctx context.Context) error {
 		s.shutdown()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		if adminServer != nil {
+			adminServer.Shutdown(shutdownCtx)
+		}
 		return httpServer.Shutdown(shutdownCtx)
 	case err := <-errCh:
 		return err
@@ -531,7 +596,9 @@ func (s *Server) runAIO(ctx context.Context) error {
 	httpsServer := s.newHTTPServer(httpsAddr)
 	httpsServer.TLSConfig = tlsConfig
 
-	errCh := make(chan error, 2)
+	adminServer := s.newAdminHTTPServer()
+
+	errCh := make(chan error, 3)
 	go func() {
 		s.logger.Info("AIO HTTP server starting", "addr", httpAddr, "domain", s.config.Domain, "version", version.Version)
 		errCh <- httpServer.ListenAndServe()
@@ -540,6 +607,12 @@ func (s *Server) runAIO(ctx context.Context) error {
 		s.logger.Info("AIO HTTPS server starting", "addr", httpsAddr, "domain", s.config.Domain, "version", version.Version)
 		errCh <- httpsServer.ListenAndServeTLS("", "")
 	}()
+	if adminServer != nil {
+		go func() {
+			s.logger.Info("admin API listening", "addr", s.config.AdminListen)
+			errCh <- adminServer.ListenAndServe()
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -549,6 +622,9 @@ func (s *Server) runAIO(ctx context.Context) error {
 		defer cancel()
 		httpServer.Shutdown(shutdownCtx)
 		httpsServer.Shutdown(shutdownCtx)
+		if adminServer != nil {
+			adminServer.Shutdown(shutdownCtx)
+		}
 		return nil
 	case err := <-errCh:
 		return err
@@ -648,12 +724,55 @@ func isHostname(s string) bool {
 	return true
 }
 
-// ServeHTTP routes requests: subdomain and verified custom-domain hosts go to
-// the proxy, everything else to the mux.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	host := hostWithoutPort(r.Host)
+// statusRecorder captures the status of the response being written so the
+// server can count it once at the handler boundary. It passes through the
+// optional interfaces the proxy relies on — Flush and Hijack — so wrapping
+// the writer does not change behavior.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
 
-	if host == s.config.ControlDomain {
+func (rec *statusRecorder) WriteHeader(code int) {
+	if rec.status == 0 {
+		rec.status = code
+	}
+	rec.ResponseWriter.WriteHeader(code)
+}
+
+func (rec *statusRecorder) Write(b []byte) (int, error) {
+	if rec.status == 0 {
+		rec.status = http.StatusOK
+	}
+	return rec.ResponseWriter.Write(b)
+}
+
+func (rec *statusRecorder) Flush() {
+	if f, ok := rec.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (rec *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := rec.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("response writer does not support hijacking")
+	}
+	return h.Hijack()
+}
+
+// ServeHTTP routes requests: subdomain and verified custom-domain hosts go to
+// the proxy, everything else to the mux. Every response is counted — a
+// statusRecorder wraps the writer so edge-generated 4xx/5xx land in /metrics
+// alongside proxied ones.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	rec := &statusRecorder{ResponseWriter: w}
+	defer func() { s.metrics.RecordHTTPResponse(rec.status) }()
+	w = rec
+
+	host := normalizeHost(r.Host)
+
+	if s.config.ControlDomain != "" && host == s.config.ControlDomain {
 		s.mux.ServeHTTP(w, r)
 		return
 	}
@@ -1156,17 +1275,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	usersLoaded := s.users.Count()
-	if usersLoaded == 0 {
+	// Deliberately no counts: /ready is unauthenticated infrastructure
+	// surface, and the loaded-user count is business information a stranger
+	// has no reason to read.
+	if s.users.Count() == 0 {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		fmt.Fprintf(w, `{"status":"not_ready","reason":"no_users_loaded"}`)
 		return
 	}
 
-	fmt.Fprintf(w, `{"status":"ready","active_tunnels":%d,"users_loaded":%d}`,
-		s.tunnels.ActiveCount(),
-		usersLoaded,
-	)
+	fmt.Fprintf(w, `{"status":"ready"}`)
 }
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
@@ -1175,8 +1293,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"service":"mabo-tunnel","version":%q,"domain":%q,"active_tunnels":%d}`,
-		version.Version,
+	fmt.Fprintf(w, `{"service":"mabo-tunnel","domain":%q,"active_tunnels":%d}`,
 		s.config.Domain,
 		s.tunnels.ActiveCount(),
 	)

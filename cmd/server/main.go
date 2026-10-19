@@ -64,7 +64,7 @@ func main() {
 
 	var trustedProxies string
 	flag.StringVar(&trustedProxies, "trusted-proxies", envOrDefault("MABO_TUNNEL_TRUSTED_PROXIES", ""),
-		"Comma-separated CIDRs whose X-Forwarded-For header is trusted (default: loopback and private ranges)")
+		"Comma-separated CIDRs whose X-Forwarded-For header is trusted (default: loopback only)")
 	var customDomains string
 	flag.StringVar(&customDomains, "custom-domains", envOrDefault("MABO_TUNNEL_CUSTOM_DOMAINS", ""),
 		"Comma-separated zone suffixes under which users may register verified custom domains\n  (e.g. \"apps.example.com\" allows wilmer.apps.example.com via a TXT challenge)")
@@ -82,6 +82,8 @@ func main() {
 	var dnsSecret string
 	flag.StringVar(&dnsSecret, "aio-dns-secret", envOrDefault("MABO_TUNNEL_AIO_DNS_SECRET", ""), "Provider's second credential (AWS Secret Access Key for route53; unused otherwise)")
 	flag.StringVar(&cfg.AdminToken, "admin-token", envOrDefault("MABO_TUNNEL_ADMIN_TOKEN", ""), "Enable the admin API (/admin/*, /metrics) guarded by this token. Empty disables both.")
+	flag.StringVar(&cfg.AdminListen, "admin-listen", envOrDefault("MABO_TUNNEL_ADMIN_LISTEN", ""),
+		"Serve /admin/* and /metrics on this address only (e.g. 127.0.0.1:9999). Empty keeps them on --addr.")
 
 	showVer := flag.Bool("version", false, "Print version and exit")
 	doUpgrade := flag.Bool("upgrade", false, "Self-update this binary from GitHub Releases, then exit")
