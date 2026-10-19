@@ -68,6 +68,13 @@ func displayName(binary string) string { return assetPrefix + "-" + binary }
 // atomically swap it in. The original binary stays byte-for-byte intact until
 // the verified replacement is ready to rename over it.
 func Run(ctx context.Context, opts Options) (Result, error) {
+	return runForPlatform(ctx, opts, runtime.GOOS, runtime.GOARCH)
+}
+
+// runForPlatform is Run's implementation with the target platform supplied by
+// the caller. Keeping this separate makes unsupported release-asset behavior
+// deterministic in tests instead of relying on the runner not being Linux/amd64.
+func runForPlatform(ctx context.Context, opts Options, goos, goarch string) (Result, error) {
 	out := opts.Stdout
 	if out == nil {
 		out = os.Stdout
@@ -131,7 +138,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		fmt.Fprintf(errw, "Note: current version %q is not a release build; installing %s\n", from, to)
 	}
 
-	name := AssetName(opts.Binary, runtime.GOOS, runtime.GOARCH)
+	name := AssetName(opts.Binary, goos, goarch)
 	if _, err := findAsset(rel, name); err != nil {
 		return Result{}, fmt.Errorf("%w: need asset %s", err, name)
 	}

@@ -87,17 +87,23 @@ endif
 
 # Internal: build one release binary for a given OS/ARCH/OUTPUT.
 # Usage: $(call aio_build,OS,ARCH,OUTPUT)
+#
+# The embed + build steps share one shell so a trapped EXIT removes
+# cmd/server/embedded.go on any exit — failure or interruption included, not
+# just the success path. The file is encrypted and gitignored, but it is the
+# one artifact holding the user database, so it must not linger.
 define aio_build
 	@echo ""
 	@echo "==> Building $(3) ($(1)/$(2))..."
 	@echo "    Embedding encrypted config..."
-	@go run ./cmd/embed-secrets \
+	@set -e; \
+	trap 'rm -f cmd/server/embedded.go' EXIT; \
+	go run ./cmd/embed-secrets \
 	  --domain=$(AIO_DOMAIN) --aio-email=$(AIO_EMAIL) --aio-bind=$(AIO_BIND) \
 	  --aio-cert-path=$(AIO_CERT_PATH) --aio-cf-token=$(CF_API_TOKEN) \
 	  --aio-dns-provider=$(AIO_DNS_PROVIDER) --aio-dns-secret="$(AIO_DNS_SECRET)" \
-	  --users-file=$(AIO_USERS) --output=cmd/server/embedded.go
+	  --users-file=$(AIO_USERS) --output=cmd/server/embedded.go; \
 	GOOS=$(1) GOARCH=$(2) go build -ldflags="-w -s $(LDFLAGS)" -o $(3) ./cmd/server
-	@rm -f cmd/server/embedded.go
 	@echo "    Done: $(3)"
 endef
 
@@ -124,7 +130,9 @@ build-aio-all:
 # AIO build without symbol stripping (for dev/testing)
 build-aio-dev:
 	@mkdir -p build
-	@go run ./cmd/embed-secrets \
+	@set -e; \
+	trap 'rm -f cmd/server/embedded.go' EXIT; \
+	go run ./cmd/embed-secrets \
 	  --domain=$(AIO_DOMAIN) \
 	  --aio-email=$(AIO_EMAIL) \
 	  --aio-bind=$(AIO_BIND) \
@@ -132,9 +140,8 @@ build-aio-dev:
 	  --aio-cf-token=$(CF_API_TOKEN) \
 	  --aio-dns-provider=$(AIO_DNS_PROVIDER) --aio-dns-secret="$(AIO_DNS_SECRET)" \
 	  --users-file=$(AIO_USERS) \
-	  --output=cmd/server/embedded.go
-	@go build -o $(BINARY_SERVER) ./cmd/server
-	@rm -f cmd/server/embedded.go
+	  --output=cmd/server/embedded.go; \
+	go build -o $(BINARY_SERVER) ./cmd/server
 	@echo "Built AIO binary (dev): $(BINARY_SERVER)"
 
 # Cross-compilation

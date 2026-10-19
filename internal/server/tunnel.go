@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"maps"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -98,6 +99,11 @@ type Tunnel struct {
 	// pendingCount is the number of in-flight proxied HTTP connections, used
 	// to enforce maxProxiedPerTunnel without walking the map.
 	pendingCount atomic.Int64
+
+	// upgradePending counts WebSocket upgrades waiting for this tunnel's
+	// first response — the pool maxUpgradePendingPerTunnel bounds so fake
+	// handshakes cannot occupy the whole in-flight budget.
+	upgradePending atomic.Int64
 
 	// tcpConns tracks active TCP connections for bidirectional streaming.
 	tcpConns sync.Map // connID → *connWriter
@@ -486,9 +492,18 @@ type TunnelManager struct {
 	byCustom map[string]*Tunnel
 
 	// TCP port allocation
-	tcpPortMin int            // start of TCP port range (inclusive)
-	tcpPortMax int            // end of TCP port range (inclusive)
-	tcpUsed    map[int]string // port → tunnel ID
+	tcpPortMin  int            // start of TCP port range (inclusive)
+	tcpPortMax  int            // end of TCP port range (inclusive)
+	tcpUsed     map[int]string // port → tunnel ID
+	tcpBindHost string         // interface TCP listeners bind to; "" = all
+}
+
+// SetTCPBindHost sets the interface TCP tunnel listeners bind to. Empty (the
+// default) means all interfaces.
+func (m *TunnelManager) SetTCPBindHost(host string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tcpBindHost = host
 }
 
 // NewTunnelManager creates a new TunnelManager with stale cleanup.
@@ -550,13 +565,7 @@ func (m *TunnelManager) cleanupStale() {
 				"idle", now.Sub(lastActivity),
 			)
 			// Reserve the subdomain for the session before removing.
-			if tunnel.SessionID != "" {
-				m.reserved[tunnel.SessionID] = &reservation{
-					subdomain: tunnel.Subdomain,
-					username:  tunnel.Username,
-					expiresAt: now.Add(5 * time.Minute),
-				}
-			}
+			m.reserveLocked(tunnel.SessionID, tunnel.Subdomain, tunnel.Username, now.Add(5*time.Minute))
 			m.removeTunnelLocked(tunnel)
 		}
 	}
@@ -617,6 +626,34 @@ func (t *Tunnel) SetIPFilters(allowed, denied []string) {
 	t.deniedNets = parseIPNets(denied)
 }
 
+// ipAllowed reports whether an address passes the tunnel's deny and allow
+// lists: deny wins, and a non-empty allow list makes the tunnel exclusive. A
+// nil address (no origin could be established) passes only when the tunnel
+// has no allow list. Both proxy paths — HTTP requests and raw TCP connections
+// — enforce this same decision.
+func (t *Tunnel) ipAllowed(ip net.IP) bool {
+	if len(t.deniedNets) == 0 && len(t.allowedNets) == 0 {
+		return true
+	}
+	for _, denied := range t.deniedNets {
+		if ip != nil && denied.Contains(ip) {
+			return false
+		}
+	}
+	if len(t.allowedNets) > 0 {
+		if ip == nil {
+			return false
+		}
+		for _, allowed := range t.allowedNets {
+			if allowed.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
 // RegisterOpts holds parameters for tunnel registration.
 type RegisterOpts struct {
 	Conn         *websocket.Conn
@@ -631,6 +668,48 @@ type RegisterOpts struct {
 	BasicAuth    string // "user:pass" for HTTP Basic Auth
 	CustomDomain string // verified custom hostname ("" = none)
 	Binary       bool   // client negotiated binary data frames
+}
+
+// maxSubdomainLen is the DNS label limit.
+const maxSubdomainLen = 63
+
+// reservedSubdomains are names a tunnel may not take: infrastructure names
+// users expect to resolve to the operator or to mail and service hosts, which
+// any tenant could otherwise impersonate.
+var reservedSubdomains = map[string]bool{
+	"www": true, "admin": true, "api": true,
+	"mail": true, "smtp": true, "imap": true, "pop": true, "ftp": true,
+	"ns1": true, "ns2": true, "webmail": true, "cpanel": true,
+	"autoconfig": true, "autodiscover": true, "localhost": true,
+	"_acme-challenge": true,
+}
+
+// normalizeSubdomain lowercases a requested subdomain and rejects anything
+// that is not a single DNS label, so every registry key is one canonical form
+// and nothing unrepresentable in DNS (underscores, dots, leading hyphens or
+// trailing ones, "*", reserved infrastructure names) can be registered. An
+// empty request stays empty and means "no explicit request".
+func normalizeSubdomain(sub string) (string, error) {
+	sub = strings.ToLower(strings.TrimSpace(sub))
+	if sub == "" {
+		return "", nil
+	}
+	if len(sub) > maxSubdomainLen {
+		return "", fmt.Errorf("subdomain too long: %d chars (max %d)", len(sub), maxSubdomainLen)
+	}
+	if reservedSubdomains[sub] {
+		return "", fmt.Errorf("subdomain %q is reserved", sub)
+	}
+	if sub[0] == '-' || sub[len(sub)-1] == '-' {
+		return "", fmt.Errorf("subdomain %q must not start or end with a hyphen", sub)
+	}
+	for i := 0; i < len(sub); i++ {
+		c := sub[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+			return "", fmt.Errorf("subdomain %q may contain only lowercase letters, digits, and hyphens", sub)
+		}
+	}
+	return sub, nil
 }
 
 // LookupCustom finds a tunnel by its verified custom hostname.
@@ -654,14 +733,62 @@ func (m *TunnelManager) registerTunnelLocked(t *Tunnel) {
 	m.byUser[t.Username]++
 }
 
-// removeTunnelLocked tears down and unmaps a tunnel from all lookup tables.
-// Must be called with m.mu held.
+// removeTunnelLocked tears down and unmaps a tunnel from all lookup tables,
+// releasing its share of the user's quota. Must be called with m.mu held.
 func (m *TunnelManager) removeTunnelLocked(t *Tunnel) {
 	m.teardownLocked(t)
+	if _, registered := m.tunnels[t.ID]; !registered {
+		return
+	}
 	delete(m.tunnels, t.ID)
-	delete(m.byHost, t.Subdomain)
+
+	// Delete mappings by identity: only drop an entry when this tunnel is the
+	// one it points at. A custom-domain tunnel never owns a byHost entry, so
+	// an unconditional delete would tear down whichever other user's tunnel
+	// currently holds its generated subdomain (F-02).
+	if cur, ok := m.byHost[t.Subdomain]; ok && cur == t {
+		delete(m.byHost, t.Subdomain)
+	}
 	if t.CustomHost != "" {
-		delete(m.byCustom, t.CustomHost)
+		if cur, ok := m.byCustom[t.CustomHost]; ok && cur == t {
+			delete(m.byCustom, t.CustomHost)
+		}
+	}
+
+	// Quota accounting lives here so every removal path counts, including the
+	// stale-tunnel sweep (F-16).
+	if n := m.byUser[t.Username]; n <= 1 {
+		delete(m.byUser, t.Username)
+	} else {
+		m.byUser[t.Username] = n - 1
+	}
+}
+
+// maxReservations bounds the reconnect-reservation table. Each entry keeps a
+// subdomain out of circulation for up to five minutes; without a bound a
+// user cycling tunnels could grow the table without limit.
+const maxReservations = 1024
+
+// reserveLocked records a reconnect reservation, evicting the entry closest
+// to expiry when the table is full. Must be called with m.mu held.
+func (m *TunnelManager) reserveLocked(sessionID, subdomain, username string, expires time.Time) {
+	if sessionID == "" || subdomain == "" {
+		return
+	}
+	if len(m.reserved) >= maxReservations {
+		oldestID := ""
+		var oldest time.Time
+		for sid, res := range m.reserved {
+			if oldestID == "" || res.expiresAt.Before(oldest) {
+				oldestID, oldest = sid, res.expiresAt
+			}
+		}
+		delete(m.reserved, oldestID)
+	}
+	m.reserved[sessionID] = &reservation{
+		subdomain: subdomain,
+		username:  username,
+		expiresAt: expires,
 	}
 }
 
@@ -712,8 +839,12 @@ func (m *TunnelManager) Register(opts RegisterOpts) (*Tunnel, error) {
 		}
 	}
 
-	if len(subdomain) > 63 {
-		return nil, fmt.Errorf("subdomain too long: %d chars (max 63)", len(subdomain))
+	// One choke point for the final composed value (explicit request, named
+	// tunnel, session reuse, or generated): every registry key is a
+	// normalized, valid DNS label.
+	subdomain, err := normalizeSubdomain(subdomain)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := m.checkSubdomainClaim(subdomain, opts); err != nil {
@@ -737,7 +868,6 @@ func (m *TunnelManager) Register(opts RegisterOpts) (*Tunnel, error) {
 				"session_id", opts.SessionID,
 				"custom_domain", host,
 			)
-			m.byUser[holder.Username]--
 			m.removeTunnelLocked(holder)
 		}
 	}
@@ -801,7 +931,6 @@ func (m *TunnelManager) checkSubdomainClaim(subdomain string, opts RegisterOpts)
 			existing.doneOnce.Do(func() { close(existing.done) })
 			existing.Conn.Close()
 			m.removeTunnelLocked(existing)
-			m.byUser[existing.Username]--
 			return nil
 		}
 		return fmt.Errorf("subdomain %q is already in use", subdomain)
@@ -844,11 +973,7 @@ func (m *TunnelManager) Unregister(tunnelID string) {
 
 	// Only reserve if NOT a graceful close (Ctrl+C) and session ID exists.
 	if !tunnel.graceful.Load() && tunnel.SessionID != "" {
-		m.reserved[tunnel.SessionID] = &reservation{
-			subdomain: tunnel.Subdomain,
-			username:  tunnel.Username,
-			expiresAt: time.Now().Add(5 * time.Minute),
-		}
+		m.reserveLocked(tunnel.SessionID, tunnel.Subdomain, tunnel.Username, time.Now().Add(5*time.Minute))
 		m.logger.Info("subdomain reserved for reconnect",
 			"session_id", tunnel.SessionID,
 			"username", tunnel.Username,
@@ -863,7 +988,6 @@ func (m *TunnelManager) Unregister(tunnelID string) {
 	}
 
 	m.removeTunnelLocked(tunnel)
-	m.byUser[tunnel.Username]--
 }
 
 // LookupByHost finds a tunnel by its subdomain.
@@ -944,8 +1068,10 @@ func (m *TunnelManager) RegisterTCP(opts RegisterOpts) (*Tunnel, error) {
 		return nil, err
 	}
 
-	// Start listening on the allocated port.
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	// Start listening on the allocated port. The bind host follows --addr so a
+	// server configured for loopback does not publish raw TCP tunnels to the
+	// world (F-09).
+	listener, err := net.Listen("tcp", net.JoinHostPort(m.tcpBindHost, strconv.Itoa(port)))
 	if err != nil {
 		delete(m.tcpUsed, port)
 		return nil, fmt.Errorf("listen on TCP port %d: %w", port, err)
@@ -972,6 +1098,13 @@ func (m *TunnelManager) RegisterTCP(opts RegisterOpts) (*Tunnel, error) {
 			delete(m.tcpUsed, port)
 			return nil, err
 		}
+	}
+
+	subdomain, err = normalizeSubdomain(subdomain)
+	if err != nil {
+		listener.Close()
+		delete(m.tcpUsed, port)
+		return nil, err
 	}
 
 	if err := m.checkSubdomainClaim(subdomain, opts); err != nil {

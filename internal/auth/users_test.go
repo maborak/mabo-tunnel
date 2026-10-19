@@ -3,6 +3,8 @@ package auth
 import (
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -153,13 +155,28 @@ func TestRateLimiterBlocksAfterMax(t *testing.T) {
 
 	const ip = "203.0.113.1"
 	for i := 0; i < 3; i++ {
-		if !rl.Allow(ip) {
+		if !rl.Take(ip) {
 			t.Fatalf("attempt %d blocked before the limit", i+1)
 		}
-		rl.Record(ip)
 	}
-	if rl.Allow(ip) {
+	if rl.Take(ip) {
 		t.Error("expected the address to be blocked after 3 failures")
+	}
+}
+
+// A successful authentication refunds its attempt, so healthy reconnects do
+// not consume the address's budget.
+func TestRateLimiterRefundFreesBudget(t *testing.T) {
+	rl := NewRateLimiter(2, time.Minute)
+	defer rl.Stop()
+
+	const ip = "203.0.113.9"
+	if !rl.Take(ip) {
+		t.Fatal("first attempt should be admitted")
+	}
+	rl.Refund(ip)
+	if !rl.Take(ip) {
+		t.Fatal("attempt after a refund should be admitted")
 	}
 }
 
@@ -168,14 +185,14 @@ func TestRateLimiterRecoversAfterWindow(t *testing.T) {
 	defer rl.Stop()
 
 	const ip = "203.0.113.2"
-	rl.Record(ip)
-	rl.Record(ip)
-	if rl.Allow(ip) {
+	rl.Take(ip)
+	rl.Take(ip)
+	if rl.Take(ip) {
 		t.Fatal("expected the address to be blocked")
 	}
 
 	time.Sleep(150 * time.Millisecond)
-	if !rl.Allow(ip) {
+	if !rl.Take(ip) {
 		t.Error("expected the address to be allowed once the window passed")
 	}
 }
@@ -187,7 +204,7 @@ func TestRateLimiterDropsExpiredEntries(t *testing.T) {
 	defer rl.Stop()
 
 	for i := 0; i < 100; i++ {
-		rl.Record(fmt.Sprintf("198.51.100.%d", i))
+		rl.Take(fmt.Sprintf("198.51.100.%d", i))
 	}
 	if got := rl.TrackedIPs(); got != 100 {
 		t.Fatalf("TrackedIPs() = %d, want 100", got)
@@ -210,11 +227,39 @@ func TestRateLimiterCapsTrackedAddresses(t *testing.T) {
 	rl.maxIPs = 10
 
 	for i := 0; i < 50; i++ {
-		rl.Record(fmt.Sprintf("192.0.2.%d", i))
+		rl.Take(fmt.Sprintf("192.0.2.%d", i))
 	}
 
 	if got := rl.TrackedIPs(); got > 10 {
 		t.Errorf("TrackedIPs() = %d, want at most 10", got)
+	}
+}
+
+// The limiter must admit at most maxRate concurrent attempts: with the old
+// check-then-record pair every one of N parallel attempts observed the same
+// pre-attempt state and passed.
+func TestRateLimiterConcurrentTakeAtomic(t *testing.T) {
+	rl := NewRateLimiter(5, time.Minute)
+	defer rl.Stop()
+
+	const ip = "203.0.113.77"
+	const n = 30
+
+	var admitted atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if rl.Take(ip) {
+				admitted.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := admitted.Load(); got > 5 {
+		t.Errorf("%d concurrent attempts admitted, want at most 5", got)
 	}
 }
 

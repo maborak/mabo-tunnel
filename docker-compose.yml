@@ -4,8 +4,18 @@ services:
     restart: unless-stopped
     volumes:
       - ./data/users.txt:/app/data/users.txt:ro
+    environment:
+      # Caddy reaches the server from the compose network, not loopback, so
+      # that subnet must be named as the trusted hop or every request looks
+      # like it came from the proxy (see docs/server.md).
+      - MABO_TUNNEL_TRUSTED_PROXIES=172.28.0.0/24
+      # Keep /admin/* and /metrics off the listener Caddy fronts. The port is
+      # not published to the host, so this is reachable from the compose
+      # network only; set MABO_TUNNEL_ADMIN_TOKEN to guard it.
+      - MABO_TUNNEL_ADMIN_LISTEN=0.0.0.0:9999
     expose:
       - "8080"
+      - "9999"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
       interval: 10s
@@ -34,3 +44,12 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+
+networks:
+  default:
+    ipam:
+      config:
+        # Fixed subnet so the server can name the trusted proxy hop; if this
+        # range collides on your host, change it here and in
+        # MABO_TUNNEL_TRUSTED_PROXIES together.
+        - subnet: 172.28.0.0/24

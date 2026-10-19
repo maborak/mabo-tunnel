@@ -50,7 +50,11 @@ Key files:
   and gets TLS via `dns cloudflare {env.CF_API_TOKEN}`. **Edit the domain to
   match yours.**
 - **`docker-compose.yml`** — mounts `data/users.txt` read-only, gates Caddy on
-  the mabo-tunnel healthcheck, exposes 80/443 (+443/udp for HTTP/3).
+  the mabo-tunnel healthcheck, exposes 80/443 (+443/udp for HTTP/3), and names
+  the compose subnet as `MABO_TUNNEL_TRUSTED_PROXIES` so client IPs survive the
+  proxy hop. `MABO_TUNNEL_ADMIN_LISTEN=0.0.0.0:9999` keeps `/admin/*` and
+  `/metrics` off the listener Caddy fronts; that port is not published to the
+  host. Add `MABO_TUNNEL_ADMIN_TOKEN` to guard them.
 
 To change the domain, edit `Caddyfile` (both the site block and the `tls` line
 target the base domain) and pass `--domain` to the server via the compose

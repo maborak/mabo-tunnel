@@ -45,6 +45,9 @@ func TestBodyPipeReturnsEOFWhenClosedEmpty(t *testing.T) {
 // truncated response: the request must fail instead.
 func TestBodyPipeFailsRequestOnOverflow(t *testing.T) {
 	bp := newBodyPipe(0)
+	// No consumer ever reads; shorten the stall grace so the overflow is
+	// observed without a five-second wait.
+	bp.grace = time.Millisecond
 
 	overflowed := false
 	for i := 0; i < bodyQueue+10; i++ {
@@ -60,6 +63,116 @@ func TestBodyPipeFailsRequestOnOverflow(t *testing.T) {
 	_, err := io.ReadAll(bp)
 	if !errors.Is(err, ErrBodyOverflow) {
 		t.Errorf("read error = %v, want ErrBodyOverflow", err)
+	}
+}
+
+// A queue that fills while the consumer is still connecting must be waited
+// out, not failed: the local HTTP transport starts reading the body only
+// after its connection is up, while the tunnel can deliver megabytes in that
+// window.
+func TestBodyPipeGraceAbsorbsFullQueueBeforeConsumerStarts(t *testing.T) {
+	bp := newBodyPipe(0)
+
+	for i := 0; i < bodyQueue; i++ {
+		if !bp.Send([]byte("x")) {
+			t.Fatal("queue overflowed before it was full")
+		}
+	}
+
+	// The consumer arrives only after the queue is already full, as the
+	// local transport does while its connection setup completes.
+	consumed := make(chan struct{})
+	go func() {
+		defer close(consumed)
+		time.Sleep(100 * time.Millisecond)
+		buf := make([]byte, 16)
+		for {
+			if _, err := bp.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	if !bp.Send([]byte("y")) {
+		t.Fatal("Send failed while a consumer was about to start; the grace did not apply")
+	}
+	bp.Close()
+	<-consumed
+}
+
+// A slow but progressing consumer must not fail the upload: with a full queue
+// Send waits for room, applying backpressure instead of dropping the chunk.
+func TestBodyPipeWaitsForSlowConsumer(t *testing.T) {
+	bp := newBodyPipe(0)
+
+	for i := 0; i < bodyQueue; i++ {
+		if !bp.Send([]byte("x")) {
+			t.Fatal("queue overflowed before it was full")
+		}
+	}
+
+	// The consumer shows up only after the sender has found the queue full
+	// and started waiting, then drains at its own pace.
+	release := make(chan struct{})
+	go func() {
+		<-release
+		buf := make([]byte, 16)
+		for {
+			if _, err := bp.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	sendDone := make(chan bool, 1)
+	go func() { sendDone <- bp.Send([]byte("y")) }()
+
+	// Give Send time to observe the full queue and park.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case ok := <-sendDone:
+		bp.Close()
+		t.Fatalf("Send returned %v before the consumer drained anything", ok)
+	default:
+	}
+
+	close(release)
+	select {
+	case ok := <-sendDone:
+		if !ok {
+			t.Fatal("Send failed although the consumer was draining")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Send did not resume once the consumer made room")
+	}
+	bp.Close()
+}
+
+// A pipe closed underneath a waiting Send must unblock it instead of leaving
+// the read loop parked until the grace expires.
+func TestBodyPipeCloseUnblocksWaitingSend(t *testing.T) {
+	bp := newBodyPipe(0)
+	bp.grace = 10 * time.Second
+
+	for i := 0; i < bodyQueue; i++ {
+		if !bp.Send([]byte("x")) {
+			t.Fatal("queue overflowed before it was full")
+		}
+	}
+
+	done := make(chan bool, 1)
+	go func() { done <- bp.Send([]byte("y")) }()
+
+	time.Sleep(20 * time.Millisecond)
+	bp.CloseWithError(errors.New("caller went away"))
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("Send reported success after the pipe was closed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Send did not unblock when the pipe was closed")
 	}
 }
 

@@ -17,7 +17,7 @@ in one of two modes:
 | `--domain` | `MABO_TUNNEL_DOMAIN` | `localhost` | Base domain for tunnels |
 | `--users-file` | `MABO_TUNNEL_USERS_FILE` | `data/users.txt` | Path to the user store |
 | `--log-level` | `MABO_TUNNEL_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. `debug` also turns on source locations and per-request logging |
-| `--trusted-proxies` | `MABO_TUNNEL_TRUSTED_PROXIES` | loopback + private ranges | Comma-separated CIDRs whose `X-Forwarded-For` header is believed |
+| `--trusted-proxies` | `MABO_TUNNEL_TRUSTED_PROXIES` | loopback (`127.0.0.0/8`, `::1/128`) | Comma-separated CIDRs whose `X-Forwarded-For` header is believed |
 | `--tcp-port-min` | `MABO_TUNNEL_TCP_PORT_MIN` | `10000` | Start of the TCP tunnel port range |
 | `--tcp-port-max` | `MABO_TUNNEL_TCP_PORT_MAX` | `10100` | End of the TCP tunnel port range |
 | `--aio` | — | `false` | All-in-one mode: HTTP `:80` + HTTPS `:443` + auto certs |
@@ -28,6 +28,7 @@ in one of two modes:
 | `--aio-dns-secret` | `MABO_TUNNEL_AIO_DNS_SECRET` | — | Provider's second credential (AWS Secret Access Key; unused otherwise) |
 | `--custom-domains` | `MABO_TUNNEL_CUSTOM_DOMAINS` | — | Zone suffixes users may register verified custom hostnames under |
 | `--admin-token` | `MABO_TUNNEL_ADMIN_TOKEN` | — | Enable `/admin/*` and `/metrics`, guarded by this bearer token |
+| `--admin-listen` | `MABO_TUNNEL_ADMIN_LISTEN` | same as `--addr` | Serve `/admin/*` and `/metrics` on this address only (e.g. `127.0.0.1:9999`) |
 | `--plan-free-tunnels` | `MABO_TUNNEL_PLAN_FREE_TUNNELS` | `1` | Free-plan concurrent tunnels (per-user override wins) |
 | `--plan-pro-tunnels` | `MABO_TUNNEL_PLAN_PRO_TUNNELS` | `10` | Pro-plan concurrent tunnels (per-user override wins) |
 | `--tunnel-rps` | `MABO_TUNNEL_TUNNEL_RPS` | off | Per-tunnel request-rate cap (req/s), token bucket at the edge |
@@ -68,12 +69,14 @@ WebSocket upgrades. See [deployment.md](deployment.md) for a Caddy config.
 
 `X-Forwarded-For` is caller-supplied data, so it is only honored when the
 request reached the server from a trusted hop. The default trusted set is
-loopback plus the RFC1918 private ranges, which covers a reverse proxy on the
-same host or in the same container network — the usual deployment. If your proxy
-sits on a public address, name it explicitly:
+loopback (`127.0.0.0/8`, `::1/128`), which covers a reverse proxy on the same
+host. A proxy in a container or on another machine is **not** loopback: name
+its network explicitly, or every request will look like it came from the proxy.
+The shipped `docker-compose.yml` passes the compose subnet for this reason:
 
 ```bash
---trusted-proxies=203.0.113.10/32
+--trusted-proxies=172.28.0.0/24        # a container network
+--trusted-proxies=203.0.113.10/32      # a proxy on a public address
 ```
 
 Without that the server falls back to the peer address, and a tunnel's IP allow
@@ -120,15 +123,16 @@ tunnel host).
 |------|---------|----------|
 | `/tunnel/connect` | WebSocket endpoint for clients | upgrade |
 | `/health` | Liveness | `{"status":"ok"}` |
-| `/ready` | Readiness | `200 {"status":"ready","active_tunnels":N,"users_loaded":N}` or `503 {"status":"not_ready","reason":"no_users_loaded"}` |
-| `/` | Service info | `{"service":"mabo-tunnel","version":"...","domain":...,"active_tunnels":N}` |
+| `/ready` | Readiness | `200 {"status":"ready"}` or `503 {"status":"not_ready","reason":"no_users_loaded"}` |
+| `/` | Service info | `{"service":"mabo-tunnel","domain":...,"active_tunnels":N}` |
 
 `/ready` returns `503` while zero users are loaded — wire it into your
 orchestrator's readiness probe. `/health` is used by the Docker healthcheck.
-
-The reported version comes from `internal/version`, stamped at build time by the
-Makefile and Dockerfile (`-X .../internal/version.Version=...`). An unstamped
-`go build` reports the package default.
+Neither unauthenticated endpoint reports business detail (version, user counts);
+that lives behind `--admin-token` on `/admin/stats`. The version there comes from
+`internal/version`, stamped at build time by the Makefile and Dockerfile
+(`-X .../internal/version.Version=...`); an unstamped `go build` reports the
+package default.
 
 ## Users
 
@@ -188,7 +192,16 @@ sure that port range is open in your firewall / security group.
 Set `--admin-token` to enable. Requests authenticate with
 `Authorization: Bearer <token>` (or `X-Admin-Token: <token>`); anything else —
 including no token at all, when the flag is unset — gets `404`, so existence of
-the API is not even probeable.
+the API is not even probeable. Rejected admin credentials are logged and counted
+(`mabo_admin_auth_failures_total`).
+
+By default the API and `/metrics` share the public listener, so a reverse proxy
+that forwards every path (the shipped Caddyfile terminates the apex domain too)
+would expose them to the internet — token-guarded, but reachable. Set
+`--admin-listen=127.0.0.1:9999` (or an internal-only address) to move them onto
+a separate listener the proxy does not front. The shipped `docker-compose.yml`
+binds it to the compose network on port 9999, which is not published to the
+host.
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
@@ -200,7 +213,8 @@ the API is not even probeable.
 
 Metrics include `mabo_tunnels_active`, `mabo_users_loaded`,
 `mabo_tunnels_registered_total`, `mabo_auth_attempts_total`,
-`mabo_auth_failures_total`, and `mabo_http_responses_total{status="2xx"…}`.
+`mabo_auth_failures_total`, `mabo_auth_rate_limited_total`,
+`mabo_admin_auth_failures_total`, and `mabo_http_responses_total{status="2xx"…}`.
 
 ## Hot-reloading users
 

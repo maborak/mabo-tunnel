@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/maborak/mabo-tunnel/internal/version"
@@ -28,17 +29,25 @@ type adminTunnel struct {
 
 // authorizeAdmin checks the admin bearer token. A server without
 // --admin-token answers 404 to everything, so probing cannot even learn that
-// an admin API exists.
+// an admin API exists. Every failed check is logged with the source address
+// and counted: the token is the only guard on this surface, so an operator
+// needs to see attempts against it.
 func (s *Server) authorizeAdmin(w http.ResponseWriter, r *http.Request) bool {
 	if s.config.AdminToken == "" {
 		http.NotFound(w, r)
 		return false
 	}
 	token := r.Header.Get("X-Admin-Token")
-	if auth := r.Header.Get("Authorization"); len(auth) > 7 && auth[:7] == "Bearer " {
+	// The "Bearer" scheme is case-insensitive (RFC 7235); reject on the token,
+	// never on the scheme's spelling.
+	if auth := r.Header.Get("Authorization"); len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") {
 		token = auth[7:]
 	}
 	if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(s.config.AdminToken)) != 1 {
+		s.metrics.Inc("mabo_admin_auth_failures_total", "")
+		// Do not echo request-controlled IP/path strings into logs. The counter
+		// records the event without risking log forgery from malformed headers.
+		s.logger.Warn("admin API auth failed")
 		w.Header().Set("WWW-Authenticate", `Bearer realm="mabo-tunnel-admin"`)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false

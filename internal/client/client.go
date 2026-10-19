@@ -786,7 +786,13 @@ func (c *Client) handleRequest(ctx context.Context, pr *pendingRequest) {
 		proxyReq.Host = req.Host
 	}
 	proxyReq.Header.Set("X-Forwarded-Host", req.Host)
-	proxyReq.Header.Set("X-Forwarded-Proto", "https")
+	// The edge stamps X-Forwarded-Proto with the scheme the visitor actually
+	// arrived on (honoring an operator-declared front proxy); that header was
+	// already copied above. Only a head with no stamp — an older server —
+	// falls back to https, the scheme a public tunnel almost always has.
+	if proxyReq.Header.Get("X-Forwarded-Proto") == "" {
+		proxyReq.Header.Set("X-Forwarded-Proto", "https")
+	}
 
 	// Apply header manipulation: remove headers first, then add/override.
 	for _, h := range c.config.HeadersRemove {
@@ -798,6 +804,10 @@ func (c *Client) handleRequest(ctx context.Context, pr *pendingRequest) {
 
 	resp, err := c.httpClient.Do(proxyReq)
 	if err != nil {
+		// The local request is dead: close the body pipe so a failed
+		// connection does not keep absorbing upload chunks, and a sender
+		// waiting on a full queue unblocks immediately.
+		pr.body.CloseWithError(err)
 		// If the request was canceled by the server (public caller gone),
 		// don't spam the TUI with a synthetic 502 — the server already
 		// closed the public connection.

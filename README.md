@@ -78,6 +78,23 @@ shape of tool for people who already have a VPS and a domain:
 
 ## Install
 
+### Installer (Linux/macOS)
+
+Install all three tools, or choose just `client`, `server`, or `token`. The
+installer resolves the latest GitHub release, verifies each binary against its
+`SHA256SUMS.txt`, installs user-locally to `~/.local/bin` by default, sets
+executable permissions, and offers to add the directory to the detected shell's
+PATH config. It does not require `sudo`. Use `--dir` or `DESTDIR` for another
+location, and `--no-modify-path` to leave shell config untouched.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maborak/mabo-tunnel/main/install.sh | bash
+# Or install only one:
+curl -fsSL https://raw.githubusercontent.com/maborak/mabo-tunnel/main/install.sh | bash -s -- --component client
+# Pin a release:
+curl -fsSL https://raw.githubusercontent.com/maborak/mabo-tunnel/main/install.sh | bash -s -- --version v1.2.3
+```
+
 ### Download a release
 
 Grab a binary for your platform from the
@@ -111,7 +128,7 @@ cd mabo-tunnel
 make build      # → build/mabo-tunnel-server, build/mabo-tunnel-client, build/mabo-tunnel-token
 ```
 
-Requires Go 1.26+; `go.mod` targets 1.26.6 and `GOTOOLCHAIN=auto` will fetch it.
+Requires Go 1.26.9+; `go.mod` targets 1.26.9 and `GOTOOLCHAIN=auto` will fetch it.
 
 ### Updating an installed binary
 
@@ -305,7 +322,7 @@ per tunnel, and ping latency. Press `q` or `Ctrl+C` to quit.
 | `--domain` | `MABO_TUNNEL_DOMAIN` | `localhost` | Base domain for tunnels |
 | `--users-file` | `MABO_TUNNEL_USERS_FILE` | `data/users.txt` | Path to users file |
 | `--log-level` | `MABO_TUNNEL_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
-| `--trusted-proxies` | `MABO_TUNNEL_TRUSTED_PROXIES` | loopback + private | CIDRs whose `X-Forwarded-For` is believed |
+| `--trusted-proxies` | `MABO_TUNNEL_TRUSTED_PROXIES` | loopback | CIDRs whose `X-Forwarded-For` is believed |
 | `--tcp-port-min` | `MABO_TUNNEL_TCP_PORT_MIN` | `10000` | TCP tunnel port range start |
 | `--tcp-port-max` | `MABO_TUNNEL_TCP_PORT_MAX` | `10100` | TCP tunnel port range end |
 | `--aio` | — | `false` | All-in-one mode (HTTP:80 + HTTPS:443 + auto certs) |
@@ -316,6 +333,7 @@ per tunnel, and ping latency. Press `q` or `Ctrl+C` to quit.
 | `--aio-dns-provider` | `MABO_TUNNEL_AIO_DNS_PROVIDER` | `cloudflare` | DNS-01 provider: `cloudflare`, `digitalocean`, `route53` |
 | `--aio-dns-secret` | `MABO_TUNNEL_AIO_DNS_SECRET` | — | Second credential for the provider (AWS Secret Access Key) |
 | `--admin-token` | `MABO_TUNNEL_ADMIN_TOKEN` | — | Enable `/admin/*` + `/metrics`, guarded by this bearer token |
+| `--admin-listen` | `MABO_TUNNEL_ADMIN_LISTEN` | =`--addr` | Serve `/admin/*` + `/metrics` on this address only |
 | `--custom-domains` | `MABO_TUNNEL_CUSTOM_DOMAINS` | — | Zone suffixes users may register verified hostnames under |
 | `--plan-free-tunnels` | `MABO_TUNNEL_PLAN_FREE_TUNNELS` | `1` | Free-plan concurrent tunnels (per-user override wins) |
 | `--plan-pro-tunnels` | `MABO_TUNNEL_PLAN_PRO_TUNNELS` | `10` | Pro-plan concurrent tunnels (per-user override wins) |
