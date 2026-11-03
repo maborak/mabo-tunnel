@@ -118,13 +118,13 @@ jobs:
           cache: true
 
       - name: Validate config
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: check
 
       - name: Snapshot-build all targets
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: build --snapshot --clean
